@@ -60,4 +60,7 @@ RUN chown -R rstudio:rstudio /opt/conda /home/rstudio
 # 9. 기본 실행 경로 설정
 WORKDIR /home/rstudio
 
+# 저장소 파일들을 컨테이너 안으로 복사
+COPY --chown=rstudio:rstudio . /home/rstudio/
+
 USER rstudio
