@@ -6,38 +6,58 @@ USER root
 RUN apt-get update && apt-get install -y \
     wget \
     git \
+    ca-certificates \
     imagemagick \
     libmagick++-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Miniconda 설치
-ENV CONDA_DIR /opt/conda
-RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh && \
-    /bin/bash ~/miniconda.sh -b -p /opt/conda && \
-    rm ~/miniconda.sh
+# 3. Miniforge 설치
+# Miniforge는 conda-forge 기반 conda 배포판이라 GitHub Actions에서 더 안정적이다.
+ENV CONDA_DIR=/opt/conda
+ENV PATH=${CONDA_DIR}/bin:${PATH}
 
-# 4. Conda 경로 설정 및 Python 환경 생성
-ENV PATH=$CONDA_DIR/bin:$PATH
-RUN conda create -n r-reticulate python=3.10 -y && \
-    conda install -n r-reticulate -c conda-forge \
-        numpy pandas matplotlib scipy ipykernel -y && \
-    conda install -c conda-forge \
-        jupyter jupyterlab notebook -y && \
-    /opt/conda/envs/r-reticulate/bin/python -m ipykernel install \
-        --name r-reticulate \
-        --display-name "Python (r-reticulate)" \
-        --prefix=/opt/conda && \
+RUN wget --quiet \
+    https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
+    -O /tmp/miniforge.sh && \
+    /bin/bash /tmp/miniforge.sh -b -p ${CONDA_DIR} && \
+    rm /tmp/miniforge.sh && \
+    conda config --system --set channel_priority strict
+
+# 4. reticulate용 Python 환경 생성
+RUN conda create -n r-reticulate -c conda-forge --override-channels \
+    python=3.10 \
+    numpy \
+    pandas \
+    matplotlib \
+    scipy \
+    ipykernel \
+    notebook \
+    jupyterlab \
+    -y && \
     conda clean -afy
 
-# 5. R 패키지 설치
+# 5. r-reticulate 환경을 기본 PATH에 추가
+ENV PATH=/opt/conda/envs/r-reticulate/bin:${CONDA_DIR}/bin:${PATH}
+ENV RETICULATE_PYTHON=/opt/conda/envs/r-reticulate/bin/python
+
+# 6. Jupyter kernel 등록
+RUN python -m ipykernel install \
+    --name r-reticulate \
+    --display-name "Python (r-reticulate)" \
+    --prefix=/opt/conda
+
+# 7. R 패키지 설치
 RUN R -e "install.packages(c('reticulate', 'remotes', 'IRkernel', 'NHANES', 'Lahman', 'mosaic'), repos = 'https://cloud.r-project.org')" && \
     R -e "IRkernel::installspec(user = FALSE)"
 
-# 6. reticulate가 사용할 Python 경로 고정
-ENV RETICULATE_PYTHON=/opt/conda/envs/r-reticulate/bin/python
+# 8. Binder/일반 사용자를 위한 권한 설정
+# rocker/tidyverse 이미지에는 rstudio 사용자가 있다.
+ENV NB_USER=rstudio
+ENV HOME=/home/rstudio
 
-# 7. Binder 사용자를 위한 권한 설정
-RUN chown -R ${NB_USER:-root} /opt/conda
+RUN chown -R rstudio:rstudio /opt/conda /home/rstudio
 
-# 기본 실행 경로 설정
+# 9. 기본 실행 경로 설정
 WORKDIR /home/rstudio
+
+USER rstudio
