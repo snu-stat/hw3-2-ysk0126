@@ -1,7 +1,7 @@
 ---
 title: "숙제 3"
 subtitle: "데이터과학 입문"
-author: "원중호"
+author: "김연수"
 date: today
 date-format: "MMMM YYYY"
 institute: 서울대학교 통계학과
@@ -13,10 +13,132 @@ mainfont: "Noto Sans Korean Light"
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, message = FALSE, fig.width=6, fig.height=4, out.width = "70%", fig.align = "center", python.reticulate = TRUE)  
+# 글로벌 옵션 설정
+
+knitr::opts_chunk$set(
+
+  echo = TRUE,
+
+  eval = TRUE,
+
+  warning = FALSE,
+
+  message = FALSE,
+
+  fig.width = 6,
+
+  fig.height = 4,
+
+  out.width = "70%",
+
+  fig.align = "center",
+
+  python.reticulate = TRUE
+
+)
+
 options(knitr.table.format = "html")
-reticulate::use_condaenv(condaenv = "introds", conda = "/opt/homebrew/bin/conda") # for persistency
+
+library(reticulate)
+
+# ------------------------------------------------------------
+
+# reticulate Python 환경 설정
+
+# ------------------------------------------------------------
+
+# 1. GitHub/Binder/Docker 환경에서는 RETICULATE_PYTHON 환경변수를 우선 사용한다.
+
+# 2. 로컬 Mac에서는 introds, r-reticulate, base conda 환경을 순서대로 찾는다.
+
+# 3. 특정 개인 컴퓨터 경로(/opt/homebrew/bin/conda)를 하드코딩하지 않는다.
+
+setup_python <- function() {
+
+  reticulate_python <- Sys.getenv("RETICULATE_PYTHON")
+
+  if (nzchar(reticulate_python) && file.exists(reticulate_python)) {
+
+    reticulate::use_python(reticulate_python, required = TRUE)
+
+    return(invisible(reticulate_python))
+
+  }
+
+  conda_candidates <- c(
+
+    Sys.which("conda"),
+
+    "/opt/homebrew/bin/conda",
+
+    "/usr/local/bin/conda",
+
+    file.path(reticulate::miniconda_path(), "bin", "conda"),
+
+    "/opt/conda/bin/conda"
+
+  )
+
+  conda_candidates <- unique(path.expand(conda_candidates[nzchar(conda_candidates)]))
+
+  conda_candidates <- conda_candidates[file.exists(conda_candidates)]
+
+  if (length(conda_candidates) > 0) {
+
+    for (conda_bin in conda_candidates) {
+
+      envs <- tryCatch(
+
+        reticulate::conda_list(conda = conda_bin),
+
+        error = function(e) data.frame(name = character())
+
+      )
+
+      for (env_name in c("introds", "r-reticulate", "base")) {
+
+        if (env_name %in% envs$name) {
+
+          reticulate::use_condaenv(
+
+            condaenv = env_name,
+
+            conda = conda_bin,
+
+            required = TRUE
+
+          )
+
+          return(invisible(conda_bin))
+
+        }
+
+      }
+
+    }
+
+  }
+
+  stop(
+
+    paste(
+
+      "Python/conda 환경을 찾지 못했습니다.",
+
+      "아래 안내의 '지금 바로 할 일 2' 코드를 R 콘솔에서 한 번 실행한 뒤,",
+
+      "R session을 재시작하고 다시 Render 하세요."
+
+    )
+
+  )
+
+}
+
+setup_python()
 ```
+
+
 
 ## 지시사항
 
@@ -65,6 +187,600 @@ Python code
 
 ### 답안
 
+이 문제의 목표는 20세 이상 NHANES 참여자들을 대상으로 현재 흡연 여부를 예측하는 로지스틱 회귀모형을 만드는 것이다. 
+주의할 점은 `SmokeNow` 변수가 평생 담배를 100개비 이상 피운 적이 없는 사람에게는 결측값으로 기록되어 있다는 것이다. 
+따라서 `SmokeNow`의 결측값을 단순히 제거하면 비흡연자를 잘못 제외하게 된다.
+
+이 분석에서는 현재 흡연 여부를 다음과 같이 새로 정의하였다.
+
+$begin:math:display$
+\\text\{current smoker\} \=
+\\begin\{cases\}
+1\, \& \\text\{Smoke100 \= Yes and SmokeNow \= Yes\}\\\\
+0\, \& \\text\{Smoke100 \= No\}\\\\
+0\, \& \\text\{Smoke100 \= Yes and SmokeNow \= No\}
+\\end\{cases\}
+$end:math:display$
+
+즉, 평생 100개비 이상 피운 적이 있고 현재도 흡연한다고 응답한 사람만 현재 흡연자로 정의하였다. 
+평생 100개비 이상 피운 적이 없는 사람은 `SmokeNow`가 결측이어도 현재 비흡연자로 재코딩하였다.
+
+설명변수로는 흡연 여부를 직접 정의하는 데 사용된 `Smoke100`, `SmokeNow`와 흡연 시작 나이 관련 변수는 제외하고, 인구사회학적 변수와 건강 관련 변수를 사용하였다. 
+나이는 현재 흡연 확률과 비선형 관계를 가질 수 있으므로 중심화한 나이와 중심화한 나이의 제곱항을 함께 포함하였다.
+
+::: {.panel-tabset}
+
+## R
+
+```{r}
+library(tidyverse)
+library(NHANES)
+
+# 기준수준을 안전하게 지정하는 함수
+# 해당 기준수준이 실제 factor level 안에 있을 때만 relevel을 수행한다.
+relevel_if_present <- function(x, ref) {
+  x <- factor(x)
+  if (ref %in% levels(x)) {
+    forcats::fct_relevel(x, ref)
+  } else {
+    x
+  }
+}
+
+# 1. 20세 이상 대상자만 선택하고 현재 흡연 여부를 새로 정의한다.
+nhanes_adult_raw <- NHANES %>%
+  filter(Age >= 20) %>%
+  mutate(
+    current_smoker = case_when(
+      Smoke100 == "Yes" & SmokeNow == "Yes" ~ "Yes",
+      Smoke100 == "Yes" & SmokeNow == "No"  ~ "No",
+      Smoke100 == "No"                      ~ "No",
+      TRUE                                  ~ NA_character_
+    )
+  )
+
+# Smoke100, SmokeNow, 새로 만든 current_smoker의 관계 확인
+smoke_recode_check <- nhanes_adult_raw %>%
+  count(Smoke100, SmokeNow, current_smoker, name = "n") %>%
+  arrange(Smoke100, SmokeNow, current_smoker)
+
+knitr::kable(
+  smoke_recode_check,
+  caption = "Smoke100, SmokeNow와 새로 정의한 현재 흡연 여부"
+)
+```
+
+```{r}
+# 2. 로지스틱 회귀 분석용 데이터 생성
+# Smoke100과 SmokeNow는 반응변수 생성에 사용되었으므로 설명변수에서 제외한다.
+# SmokeAge 등 흡연 이력 관련 변수도 현재 흡연 여부를 너무 직접적으로 설명하므로 제외한다.
+
+nhanes_smoke <- nhanes_adult_raw %>%
+  mutate(
+    current_smoker = factor(current_smoker, levels = c("No", "Yes")),
+
+    # 나이는 비선형 효과를 고려하기 위해 중심화한 뒤 제곱항을 추가한다.
+    Age_c = Age - mean(Age, na.rm = TRUE),
+    Age_c2 = Age_c^2,
+
+    # 범주형 변수 기준수준 지정
+    Gender = relevel_if_present(Gender, "female"),
+    Race1 = relevel_if_present(Race1, "White"),
+    Education = relevel_if_present(Education, "College Grad"),
+    MaritalStatus = relevel_if_present(MaritalStatus, "Married"),
+    HealthGen = relevel_if_present(HealthGen, "Excellent"),
+    PhysActive = relevel_if_present(PhysActive, "Yes"),
+    Alcohol12PlusYr = relevel_if_present(Alcohol12PlusYr, "No"),
+    SurveyYr = factor(SurveyYr)
+  ) %>%
+  select(
+    current_smoker,
+    Age_c, Age_c2,
+    Gender, Race1, Education, MaritalStatus,
+    Poverty, BMI, HealthGen, PhysActive,
+    Alcohol12PlusYr, SurveyYr
+  ) %>%
+  drop_na()
+
+analysis_summary <- tibble(
+  adult_nhanes_n = nrow(nhanes_adult_raw),
+  analysis_n = nrow(nhanes_smoke),
+  current_smoker_n = sum(nhanes_smoke$current_smoker == "Yes"),
+  current_smoking_rate = mean(nhanes_smoke$current_smoker == "Yes")
+)
+
+knitr::kable(
+  analysis_summary,
+  digits = 3,
+  caption = "분석 표본 요약"
+)
+```
+
+```{r}
+# 3. 로지스틱 회귀모형 적합
+smoke_formula <- current_smoker ~
+  Age_c + Age_c2 +
+  Gender + Race1 + Education + MaritalStatus +
+  Poverty + BMI + HealthGen + PhysActive +
+  Alcohol12PlusYr + SurveyYr
+
+smoke_fit_r <- glm(
+  smoke_formula,
+  data = nhanes_smoke,
+  family = binomial(link = "logit")
+)
+
+model_fit_r <- tibble(
+  n = nobs(smoke_fit_r),
+  AIC = AIC(smoke_fit_r),
+  null_deviance = smoke_fit_r$null.deviance,
+  residual_deviance = smoke_fit_r$deviance,
+  residual_df = smoke_fit_r$df.residual
+)
+
+knitr::kable(
+  model_fit_r,
+  digits = 3,
+  caption = "R 로지스틱 회귀모형 적합도 요약"
+)
+```
+
+```{r}
+# 4. 회귀계수, 오즈비, Wald 95% 신뢰구간 정리
+coef_table_r <- summary(smoke_fit_r)$coefficients %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("term") %>%
+  as_tibble() %>%
+  transmute(
+    term,
+    estimate = Estimate,
+    std_error = `Std. Error`,
+    z_value = `z value`,
+    p_value = `Pr(>|z|)`,
+    odds_ratio = exp(Estimate),
+    ci_low = exp(Estimate - 1.96 * `Std. Error`),
+    ci_high = exp(Estimate + 1.96 * `Std. Error`)
+  )
+
+coef_table_r %>%
+  filter(term != "(Intercept)") %>%
+  arrange(p_value) %>%
+  mutate(
+    across(
+      c(estimate, std_error, z_value, p_value, odds_ratio, ci_low, ci_high),
+      ~ round(.x, 4)
+    )
+  ) %>%
+  knitr::kable(
+    caption = "R 로지스틱 회귀 결과: p-value 순 정렬"
+  )
+```
+
+```{r}
+# 5. 유의수준 5%에서 유의한 예측변수 확인
+sig_terms_r <- coef_table_r %>%
+  filter(term != "(Intercept)", p_value < 0.05) %>%
+  arrange(p_value) %>%
+  mutate(
+    direction = if_else(odds_ratio > 1, "현재 흡연 오즈 증가", "현재 흡연 오즈 감소")
+  )
+
+sig_terms_r %>%
+  mutate(
+    across(
+      c(estimate, std_error, z_value, p_value, odds_ratio, ci_low, ci_high),
+      ~ round(.x, 4)
+    )
+  ) %>%
+  knitr::kable(
+    caption = "유의수준 5%에서 현재 흡연 여부와 관련 있는 예측변수"
+  )
+
+# 본문 해석에 사용할 문자열 생성
+sig_terms_text <- if (nrow(sig_terms_r) == 0) {
+  "유의수준 5%에서 통계적으로 유의한 예측변수는 없었다."
+} else {
+  paste0(
+    sig_terms_r$term,
+    " (OR = ",
+    round(sig_terms_r$odds_ratio, 2),
+    ", p = ",
+    signif(sig_terms_r$p_value, 3),
+    ", ",
+    sig_terms_r$direction,
+    ")",
+    collapse = "; "
+  )
+}
+```
+
+```{r}
+# 6. 예측확률 분위별 보정(calibration) 확인
+nhanes_smoke_pred <- nhanes_smoke %>%
+  mutate(
+    pred_prob = fitted(smoke_fit_r),
+    current_smoker_num = as.integer(current_smoker == "Yes"),
+    pred_group = ntile(pred_prob, 10)
+  )
+
+calibration_r <- nhanes_smoke_pred %>%
+  group_by(pred_group) %>%
+  summarise(
+    n = n(),
+    mean_predicted_probability = mean(pred_prob),
+    observed_smoking_rate = mean(current_smoker_num),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  calibration_r,
+  digits = 3,
+  caption = "예측확률 10분위별 평균 예측확률과 관측 흡연율"
+)
+
+
+ggplot(calibration_r, aes(x = mean_predicted_probability, y = observed_smoking_rate)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    x = "Mean predicted probability",
+    y = "Observed smoking rate",
+    title = "Logistic regression calibration"
+  ) +
+  theme_minimal(base_family = "sans") +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+```{r}
+# 7. Python에서 같은 로지스틱 회귀모형을 적합하기 위한 객체 생성
+# R과 Python의 범주형 변수 처리 방식 차이를 피하기 위해
+# R에서 만든 model matrix를 Python으로 넘긴다.
+
+X_smoke_py <- data.frame(
+  model.matrix(smoke_formula, data = nhanes_smoke),
+  check.names = FALSE
+)
+
+y_smoke_py <- as.integer(nhanes_smoke$current_smoker == "Yes")
+
+# Python에서 재코딩 절차를 다시 확인하기 위한 원자료
+nhanes_adult_raw_py <- nhanes_adult_raw %>%
+  select(Smoke100, SmokeNow, current_smoker)
+
+# Python 비교용 R 결과
+coef_table_r_py <- coef_table_r
+```
+
+## Python
+
+```{python}
+import numpy as np
+import pandas as pd
+from math import erfc, sqrt
+
+# 1. R에서 넘겨받은 원자료로 Python에서도 현재 흡연 여부를 재코딩한다.
+adult_py = pd.DataFrame(r.nhanes_adult_raw_py).copy()
+
+adult_py["Smoke100_str"] = adult_py["Smoke100"].astype("string")
+adult_py["SmokeNow_str"] = adult_py["SmokeNow"].astype("string")
+
+adult_py["current_smoker_py"] = pd.NA
+
+adult_py.loc[
+    (adult_py["Smoke100_str"] == "Yes") & (adult_py["SmokeNow_str"] == "Yes"),
+    "current_smoker_py"
+] = "Yes"
+
+adult_py.loc[
+    (adult_py["Smoke100_str"] == "Yes") & (adult_py["SmokeNow_str"] == "No"),
+    "current_smoker_py"
+] = "No"
+
+adult_py.loc[
+    adult_py["Smoke100_str"] == "No",
+    "current_smoker_py"
+] = "No"
+
+recode_check_py = (
+    adult_py
+    .value_counts(
+        ["Smoke100", "SmokeNow", "current_smoker_py"],
+        dropna=False
+    )
+    .reset_index(name="n")
+    .sort_values(["Smoke100", "SmokeNow", "current_smoker_py"])
+)
+
+recode_check_py
+```
+
+```{python}
+# 2. R에서 만든 모형행렬과 반응변수를 사용한다.
+# 이렇게 하면 R과 Python의 factor 기준수준, dummy variable 생성 방식 차이를 피할 수 있다.
+
+X_df = pd.DataFrame(r.X_smoke_py).copy()
+y = np.asarray(r.y_smoke_py, dtype=float)
+
+X = X_df.to_numpy(dtype=float)
+terms = [str(col) for col in X_df.columns]
+
+print("Design matrix shape:", X.shape)
+print("Outcome mean:", round(y.mean(), 4))
+```
+
+```{python}
+# 3. numpy만 사용하여 로지스틱 회귀를 적합하는 함수
+# Newton-Raphson / IRLS 알고리즘을 직접 구현한다.
+
+def sigmoid(eta):
+    eta = np.clip(eta, -35, 35)
+    return 1 / (1 + np.exp(-eta))
+
+
+def fit_logistic_irls(X, y, max_iter=100, tol=1e-10):
+    """
+    Logistic regression by Newton-Raphson / IRLS.
+
+    Parameters
+    ----------
+    X : 2D numpy array
+        Design matrix including intercept.
+    y : 1D numpy array
+        Binary outcome coded as 0 or 1.
+
+    Returns
+    -------
+    beta : coefficient estimates
+    se : standard errors
+    mu : fitted probabilities
+    loglik : maximized log-likelihood
+    aic : Akaike information criterion
+    converged : whether the algorithm converged
+    n_iter : number of iterations
+    """
+    n, p = X.shape
+    beta = np.zeros(p)
+
+    for iteration in range(max_iter):
+        eta = X @ beta
+        mu = sigmoid(eta)
+        W = np.clip(mu * (1 - mu), 1e-8, None)
+
+        z = eta + (y - mu) / W
+        XtW = X.T * W
+        hessian = XtW @ X
+        rhs = XtW @ z
+
+        try:
+            beta_new = np.linalg.solve(hessian, rhs)
+        except np.linalg.LinAlgError:
+            beta_new = np.linalg.pinv(hessian) @ rhs
+
+        if np.max(np.abs(beta_new - beta)) < tol:
+            beta = beta_new
+            converged = True
+            break
+
+        beta = beta_new
+    else:
+        converged = False
+
+    eta = X @ beta
+    mu = sigmoid(eta)
+    W = np.clip(mu * (1 - mu), 1e-8, None)
+
+    information = (X.T * W) @ X
+    cov = np.linalg.pinv(information)
+    se = np.sqrt(np.diag(cov))
+
+    eps = 1e-12
+    loglik = np.sum(
+        y * np.log(np.clip(mu, eps, 1 - eps)) +
+        (1 - y) * np.log(np.clip(1 - mu, eps, 1 - eps))
+    )
+
+    aic = -2 * loglik + 2 * p
+
+    return beta, se, mu, loglik, aic, converged, iteration + 1
+
+
+beta_py, se_py, pred_py, loglik_py, aic_py, converged_py, n_iter_py = fit_logistic_irls(X, y)
+
+print("IRLS converged:", converged_py)
+print("Number of iterations:", n_iter_py)
+print("Python AIC:", round(aic_py, 3))
+```
+
+```{python}
+# 4. Python 로지스틱 회귀 결과 정리
+
+z_py = beta_py / se_py
+p_py = np.array([erfc(abs(z) / sqrt(2)) for z in z_py])
+
+coef_table_py = pd.DataFrame({
+    "term": terms,
+    "estimate_py": beta_py,
+    "std_error_py": se_py,
+    "z_value_py": z_py,
+    "p_value_py": p_py,
+    "odds_ratio_py": np.exp(beta_py),
+    "ci_low_py": np.exp(beta_py - 1.96 * se_py),
+    "ci_high_py": np.exp(beta_py + 1.96 * se_py)
+})
+
+coef_table_py_out = (
+    coef_table_py[coef_table_py["term"] != "(Intercept)"]
+    .sort_values("p_value_py")
+    .round(4)
+)
+
+coef_table_py_out
+```
+
+```{python}
+# 5. R과 Python 결과 비교
+
+coef_table_r = pd.DataFrame(r.coef_table_r_py).copy()
+
+comparison = (
+    coef_table_py[["term", "estimate_py", "std_error_py", "odds_ratio_py"]]
+    .merge(
+        coef_table_r[["term", "estimate", "std_error", "odds_ratio"]],
+        on="term",
+        how="inner"
+    )
+    .rename(columns={
+        "estimate": "estimate_r",
+        "std_error": "std_error_r",
+        "odds_ratio": "odds_ratio_r"
+    })
+)
+
+comparison["abs_coef_diff"] = np.abs(
+    comparison["estimate_py"] - comparison["estimate_r"]
+)
+
+comparison["abs_se_diff"] = np.abs(
+    comparison["std_error_py"] - comparison["std_error_r"]
+)
+
+max_coef_diff = comparison["abs_coef_diff"].max()
+max_se_diff = comparison["abs_se_diff"].max()
+
+print(
+    "Maximum absolute coefficient difference between R and Python:",
+    f"{max_coef_diff:.3e}"
+)
+
+print(
+    "Maximum absolute standard-error difference between R and Python:",
+    f"{max_se_diff:.3e}"
+)
+
+comparison.sort_values("abs_coef_diff", ascending=False).head(10).round(8)
+```
+```{python}
+# 6. Python에서도 예측확률 분위별 calibration 확인
+
+calibration_py = pd.DataFrame({
+    "pred_prob": pred_py,
+    "current_smoker_num": y.astype(int)
+})
+
+# 예측확률을 10개 분위로 나눈다.
+# 중복 경계값이 생길 수 있으므로 duplicates="drop"을 사용한다.
+calibration_py["pred_group"] = (
+    pd.qcut(
+        calibration_py["pred_prob"],
+        q=10,
+        labels=False,
+        duplicates="drop"
+    ) + 1
+)
+
+calibration_summary_py = (
+    calibration_py
+    .groupby("pred_group")
+    .agg(
+        n=("pred_prob", "size"),
+        mean_predicted_probability=("pred_prob", "mean"),
+        observed_smoking_rate=("current_smoker_num", "mean")
+    )
+    .reset_index()
+)
+
+calibration_summary_py.round(3)
+```
+```{python}
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(figsize=(6, 4))
+
+ax.scatter(
+    calibration_summary_py["mean_predicted_probability"],
+    calibration_summary_py["observed_smoking_rate"]
+)
+
+plot_min = min(
+    calibration_summary_py["mean_predicted_probability"].min(),
+    calibration_summary_py["observed_smoking_rate"].min()
+)
+
+plot_max = max(
+    calibration_summary_py["mean_predicted_probability"].max(),
+    calibration_summary_py["observed_smoking_rate"].max()
+)
+
+ax.plot(
+    [plot_min, plot_max],
+    [plot_min, plot_max],
+    linestyle="--"
+)
+
+ax.set_xlabel("Mean predicted probability")
+ax.set_ylabel("Observed smoking rate")
+ax.set_title("Logistic regression calibration")
+ax.grid(True, alpha=0.3)
+
+plt.show()
+```
+
+:::
+
+### 데이터 랭글링 절차 설명
+
+먼저 NHANES 자료에서 20세 이상인 사람만 선택하였다. 
+그다음 문제에서 지적한 것처럼 `SmokeNow`가 결측인 사람을 모두 제거하지 않고, `Smoke100` 정보를 함께 사용하여 현재 흡연 여부를 새로 만들었다. 
+`Smoke100 == "No"`인 사람은 평생 100개비 이상 흡연한 적이 없으므로 현재 비흡연자로 분류하였다. 
+`Smoke100 == "Yes"`이면서 `SmokeNow == "Yes"`인 사람은 현재 흡연자로, `Smoke100 == "Yes"`이면서 `SmokeNow == "No"`인 사람은 과거 흡연 경험은 있지만 현재는 흡연하지 않는 사람으로 분류하였다.
+
+분석에서는 흡연 여부를 직접 구성하는 데 사용한 `Smoke100`, `SmokeNow`는 설명변수에서 제외하였다. 
+또한 흡연 시작 나이처럼 흡연 경험 자체를 나타내는 변수도 제외하였다. 
+대신 나이, 성별, 인종, 교육수준, 결혼상태, 소득 대비 빈곤지표, BMI, 주관적 건강상태, 신체활동 여부, 음주 여부, 조사연도를 설명변수로 사용하였다. 
+범주형 변수는 로지스틱 회귀모형에서 더미변수로 변환되며, 해석이 자연스럽도록 일부 변수의 기준범주를 지정하였다.
+
+최종 분석에는 결측값이 없는 완전사례만 사용하였다. 
+20세 이상 원자료의 크기는 `r nrow(nhanes_adult_raw)`명이고, 로지스틱 회귀모형에 실제로 사용된 표본 크기는 `r nrow(nhanes_smoke)`명이다. 
+분석 표본에서 현재 흡연자는 `r sum(nhanes_smoke$current_smoker == "Yes")`명이며, 현재 흡연율은 약 `r round(100 * mean(nhanes_smoke$current_smoker == "Yes"), 1)`%이다.
+
+### 분석 결과 설명
+
+R에서는 `glm(..., family = binomial(link = "logit"))`을 사용하여 로지스틱 회귀모형을 적합하였다. 
+Python에서는 R에서 생성한 동일한 모형행렬과 반응변수를 넘겨받은 뒤, Newton-Raphson/IRLS 알고리즘을 직접 구현하여 같은 로지스틱 회귀모형을 적합하였다. 
+따라서 두 분석은 같은 데이터, 같은 반응변수, 같은 설명변수, 같은 더미변수 구성을 사용한다.
+
+회귀계수는 로그 오즈 단위이므로, 해석을 쉽게 하기 위해 지수변환한 오즈비도 함께 제시하였다. 
+오즈비가 1보다 크면 다른 변수들을 통제했을 때 해당 변수 또는 범주가 현재 흡연 오즈를 증가시키는 방향으로 관련되어 있음을 의미한다. 
+반대로 오즈비가 1보다 작으면 현재 흡연 오즈를 감소시키는 방향으로 관련되어 있음을 의미한다.
+
+유의수준 5%에서 현재 흡연 여부와 통계적으로 유의하게 관련된 항은 다음과 같다.
+
+`r sig_terms_text`
+
+이 결과는 다른 변수들을 통제한 뒤에도 위 변수들이 현재 흡연 여부를 예측하는 데 중요한 정보를 제공한다는 것을 의미한다. 
+예를 들어 어떤 범주의 오즈비가 1보다 크다면 기준범주에 비해 현재 흡연 오즈가 더 크다고 해석하고, 오즈비가 1보다 작다면 기준범주에 비해 현재 흡연 오즈가 더 작다고 해석한다. 
+연속형 변수의 경우에는 해당 변수가 1단위 증가할 때 현재 흡연 오즈가 오즈비만큼 곱해진다고 해석한다.
+
+### R과 Python 결과 비교
+
+R과 Python의 결과는 거의 동일해야 한다. 
+그 이유는 Python에서 별도로 범주형 변수를 다시 더미변수로 변환하지 않고, R에서 만든 동일한 모형행렬을 그대로 사용했기 때문이다. 
+즉, 두 언어 모두 같은 표본, 같은 반응변수, 같은 설명변수 행렬을 사용하여 같은 로지스틱 회귀모형을 적합하였다.
+
+출력된 비교 결과에서 R과 Python의 회귀계수 차이와 표준오차 차이는 매우 작은 수치 오차 수준이어야 한다. 
+만약 완전히 0이 아니라면 이는 통계적 모형의 차이 때문이 아니라 반복 알고리즘의 수렴 기준, 행렬 연산 방식, 부동소수점 계산 방식의 차이 때문이다. 
+따라서 실질적인 분석 결론은 R과 Python에서 같다고 볼 수 있다.
+
+### 한계
+
+이 분석은 교과서 연습문제의 목적에 맞추어 일반적인 로지스틱 회귀모형을 적합한 것이다. 
+NHANES는 복합표본설계 자료이므로 엄밀한 모집단 추론을 위해서는 표본가중치, 층화, 군집 정보를 반영한 survey-weighted logistic regression을 사용할 수 있다. 
+그러나 이 문제에서는 현재 흡연 여부를 재코딩하고, 20세 이상 대상자에서 현재 흡연 여부의 예측변수를 찾는 로지스틱 회귀모형을 만드는 것이 핵심이므로, 여기서는 완전사례 기반의 표준 로지스틱 회귀모형을 사용하였다.
+
+
 
 # 2부  데이터 분석 실무
 
@@ -100,11 +816,2100 @@ $$
 
 ### 답안
 
+이 문제에서는 Lahman 패키지의 `Teams` 데이터에서 코로나 시즌인 2020년을 제외하고, 2010년부터 2025년까지의 팀-시즌 자료를 사용한다. 
+Lahman의 `Teams` 데이터에서 득점은 `R`, 실점은 `RA`로 저장되어 있으므로, 분석에서는 `R`을 `RS`라는 이름으로 바꾸어 사용하였다. 
+승률은 다음과 같이 계산하였다.
+
+$begin:math:display$
+WPct\_i \= \\frac\{W\_i\}\{W\_i \+ L\_i\}
+$end:math:display$
+
+여기서 관측단위는 한 팀의 한 시즌이다. 
+즉, 각 행은 특정 연도의 특정 팀에 해당한다. 
+선수 자료와 달리 `Teams` 데이터에는 `playerID`가 없으므로, 여기서는 `teamID`와 `yearID`의 조합이 중복되지 않는지 확인하였다.
+
+첫 번째 모형은 Bill James의 Pythagorean expectation을 변형한 다음 비선형 모형이다.
+
+$begin:math:display$
+WPct\_i \= \\frac\{RS\_i\^k\}\{RS\_i\^k \+ RA\_i\^k\}
+       \= \\frac\{1\}\{1 \+ \(RA\_i \/ RS\_i\)\^k\}
+$end:math:display$
+
+두 번째 모형은 위 모형을 로짓 변환한 형태이다. 
+위 식에서 양변을 로짓 변환하면 다음과 같다.
+
+$begin:math:display$
+\\text\{logit\}\(WPct\_i\)
+\=
+\\log \\left\(\\frac\{WPct\_i\}\{1 \- WPct\_i\}\\right\)
+\=
+k \\log \\left\(\\frac\{RS\_i\}\{RA\_i\}\\right\)
+$end:math:display$
+
+따라서 절편이 없는 로지스틱 회귀모형
+
+$begin:math:display$
+W\_i \\sim \\text\{Binomial\}\(W\_i \+ L\_i\, p\_i\)\,
+\\qquad
+\\text\{logit\}\(p\_i\)
+\=
+\\beta\_1 \\log \\left\(\\frac\{RS\_i\}\{RA\_i\}\\right\)
+$end:math:display$
+
+을 적합하면, 회귀계수 $begin:math:text$\\beta\_1$end:math:text$은 Bill James 모형의 $begin:math:text$k$end:math:text$와 거의 같은 의미를 가진다.
+
+마지막으로 네 번째 문항에서는 다음과 같은 절편 없는 로지스틱 선형회귀모형을 적합한다.
+
+$begin:math:display$
+\\text\{logit\}\(p\_i\)
+\=
+\\beta\_\{RA\}\\log\(RA\_i\) \+ \\beta\_\{RS\}\\log\(RS\_i\)
+$end:math:display$
+
+이 모형에서 $begin:math:text$\\beta\_\{RS\} \\approx \-\\beta\_\{RA\}$end:math:text$이면, 두 번째 문항의 모형과 유사한 형태를 갖는다고 볼 수 있다.
+
+::: {.panel-tabset}
+
+## R
+
+```{r}
+library(tidyverse)
+library(Lahman)
+
+# ------------------------------------------------------------
+# 1. 데이터 준비
+# ------------------------------------------------------------
+
+target_years <- setdiff(2010:2025, 2020)
+
+teams_analysis <- Lahman::Teams %>%
+  as_tibble() %>%
+  filter(yearID %in% target_years) %>%
+  transmute(
+    yearID,
+    teamID,
+    lgID,
+    franchID,
+    W,
+    L,
+    RS = R,
+    RA = RA,
+    G_binom = W + L,
+    WPct = W / (W + L),
+    log_rs_ra = log(R / RA),
+    log_RA = log(RA),
+    log_RS = log(R)
+  ) %>%
+  filter(
+    !is.na(W),
+    !is.na(L),
+    !is.na(RS),
+    !is.na(RA),
+    G_binom > 0,
+    RS > 0,
+    RA > 0,
+    WPct > 0,
+    WPct < 1
+  )
+
+available_years <- sort(unique(teams_analysis$yearID))
+missing_years <- setdiff(target_years, available_years)
+
+years_not_found <- if (length(missing_years) == 0) {
+  "없음"
+} else {
+  paste(missing_years, collapse = ", ")
+}
+
+year_summary_r <- tibble(
+  requested_years = paste(target_years, collapse = ", "),
+  used_years = paste(available_years, collapse = ", "),
+  years_not_found_in_Lahman_package = years_not_found,
+  n_team_seasons = nrow(teams_analysis)
+)
+
+knitr::kable(
+  year_summary_r,
+  caption = "분석에 사용한 연도와 팀-시즌 수"
+)
+
+team_year_check_r <- teams_analysis %>%
+  count(yearID, teamID, name = "rows_per_team_year") %>%
+  summarise(
+    n_team_year_combinations = n(),
+    duplicated_team_years = sum(rows_per_team_year > 1),
+    max_rows_per_team_year = max(rows_per_team_year),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  team_year_check_r,
+  caption = "teamID와 yearID 조합의 중복 여부 확인"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 2. 문항 1: Bill James 비선형 모형 적합
+# ------------------------------------------------------------
+
+bill_james_nls_r <- nls(
+  WPct ~ 1 / (1 + (RA / RS)^k),
+  data = teams_analysis,
+  start = list(k = 2),
+  control = nls.control(maxiter = 100, warnOnly = TRUE)
+)
+
+nls_summary_r <- summary(bill_james_nls_r)
+
+k_hat_r <- unname(coef(bill_james_nls_r)["k"])
+k_se_r <- unname(nls_summary_r$coefficients["k", "Std. Error"])
+k_df_r <- df.residual(bill_james_nls_r)
+k_ci_r <- k_hat_r + c(-1, 1) * qt(0.975, df = k_df_r) * k_se_r
+
+bill_james_nls_table_r <- tibble(
+  model = "1. Bill James NLS",
+  parameter = "k",
+  estimate = k_hat_r,
+  std_error = k_se_r,
+  conf_low = k_ci_r[1],
+  conf_high = k_ci_r[2]
+)
+
+knitr::kable(
+  bill_james_nls_table_r %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "Bill James 비선형 모형의 k 추정치와 95% 신뢰구간"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 3. 문항 2: 절편 없는 로지스틱 회귀모형 적합
+#    logit(p) = beta1 * log(RS / RA)
+# ------------------------------------------------------------
+
+glm_bill_r <- glm(
+  cbind(W, L) ~ 0 + log_rs_ra,
+  data = teams_analysis,
+  family = binomial(link = "logit")
+)
+
+make_glm_table <- function(fit) {
+  summary(fit)$coefficients %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("term") %>%
+    as_tibble() %>%
+    transmute(
+      term,
+      estimate = Estimate,
+      std_error = `Std. Error`,
+      z_value = `z value`,
+      p_value = `Pr(>|z|)`,
+      conf_low = Estimate - 1.96 * `Std. Error`,
+      conf_high = Estimate + 1.96 * `Std. Error`
+    )
+}
+
+glm_bill_coef_r <- make_glm_table(glm_bill_r)
+
+bill_logistic_table_r <- glm_bill_coef_r %>%
+  transmute(
+    model = "2. Logistic no-intercept",
+    parameter = "beta1: log(RS/RA)",
+    estimate,
+    std_error,
+    conf_low,
+    conf_high,
+    p_value
+  )
+
+knitr::kable(
+  bill_logistic_table_r %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "절편 없는 로지스틱 회귀모형의 beta1 추정치와 95% 신뢰구간"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 4. 문항 1과 문항 2 결과 비교
+# ------------------------------------------------------------
+
+compare_1_2_r <- bind_rows(
+  bill_james_nls_table_r %>%
+    select(model, parameter, estimate, std_error, conf_low, conf_high),
+  bill_logistic_table_r %>%
+    select(model, parameter, estimate, std_error, conf_low, conf_high)
+)
+
+knitr::kable(
+  compare_1_2_r %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "Bill James 비선형 모형과 로지스틱 회귀모형의 추정치 비교"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 5. 문항 3: 로지스틱 회귀모형 진단
+# ------------------------------------------------------------
+
+diag_summary_r <- tibble(
+  residual_deviance = deviance(glm_bill_r),
+  df_residual = df.residual(glm_bill_r),
+  deviance_df_ratio = residual_deviance / df_residual,
+  chi_square_p_value = pchisq(
+    residual_deviance,
+    df = df_residual,
+    lower.tail = FALSE
+  )
+)
+
+diag_interpretation_r <- if (diag_summary_r$chi_square_p_value < 0.05) {
+  "Residual deviance가 카이제곱 기준으로 유의하게 크므로, 이항모형만으로 설명되지 않는 변동 또는 모형 부적합 가능성이 있다."
+} else {
+  "Residual deviance가 자유도와 비교했을 때 지나치게 크지 않으므로, 카이제곱 기준에서 뚜렷한 모형 부적합 증거는 크지 않다."
+}
+
+knitr::kable(
+  diag_summary_r %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "Residual deviance와 카이제곱 분포 비교"
+)
+
+diag_data_r <- teams_analysis %>%
+  mutate(
+    eta = predict(glm_bill_r, type = "link"),
+    fitted_WPct = fitted(glm_bill_r),
+    deviance_resid = residuals(glm_bill_r, type = "deviance")
+  )
+```
+
+```{r}
+# 진단 1: Deviance residuals vs linear predictors
+ggplot(diag_data_r, aes(x = eta, y = deviance_resid)) +
+  geom_point(alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    x = expression("Linear predictor " * eta),
+    y = "Deviance residual",
+    title = "Deviance residuals vs linear predictors"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# 진단 2: 관측 승률과 예측 승률 비교
+ggplot(diag_data_r, aes(x = WPct, y = fitted_WPct)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  coord_equal() +
+  labs(
+    x = "Observed WPct",
+    y = "Fitted WPct",
+    title = "Observed WPct vs fitted WPct"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# ------------------------------------------------------------
+# 6. 문항 4: log(RA), log(RS)를 설명변수로 하는 절편 없는 로지스틱 회귀모형
+# ------------------------------------------------------------
+
+glm_logrsra_r <- glm(
+  cbind(W, L) ~ 0 + log_RA + log_RS,
+  data = teams_analysis,
+  family = binomial(link = "logit")
+)
+
+glm_logrsra_coef_r <- make_glm_table(glm_logrsra_r)
+
+knitr::kable(
+  glm_logrsra_coef_r %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "log(RA), log(RS)를 사용한 절편 없는 로지스틱 회귀모형"
+)
+
+b4_r <- coef(glm_logrsra_r)
+vc4_r <- vcov(glm_logrsra_r)
+
+model4_transformed_r <- tibble(
+  model = "4. two-predictor logistic",
+  parameter = c(
+    "beta_logRS",
+    "-beta_logRA",
+    "(beta_logRS - beta_logRA)/2"
+  ),
+  estimate = c(
+    unname(b4_r["log_RS"]),
+    -unname(b4_r["log_RA"]),
+    unname((b4_r["log_RS"] - b4_r["log_RA"]) / 2)
+  ),
+  std_error = c(
+    sqrt(vc4_r["log_RS", "log_RS"]),
+    sqrt(vc4_r["log_RA", "log_RA"]),
+    sqrt(
+      (
+        vc4_r["log_RS", "log_RS"] +
+          vc4_r["log_RA", "log_RA"] -
+          2 * vc4_r["log_RS", "log_RA"]
+      ) / 4
+    )
+  )
+) %>%
+  mutate(
+    conf_low = estimate - 1.96 * std_error,
+    conf_high = estimate + 1.96 * std_error
+  )
+
+model_compare_r <- bind_rows(
+  bill_james_nls_table_r %>%
+    select(model, parameter, estimate, std_error, conf_low, conf_high),
+  bill_logistic_table_r %>%
+    select(model, parameter, estimate, std_error, conf_low, conf_high),
+  model4_transformed_r %>%
+    select(model, parameter, estimate, std_error, conf_low, conf_high)
+)
+
+knitr::kable(
+  model_compare_r %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "모형 1, 2, 4의 주요 모수 추정치 비교"
+)
+
+# Python에서 같은 자료와 R 결과를 사용할 수 있도록 객체를 넘긴다.
+teams_analysis_py <- teams_analysis
+model_compare_r_py <- model_compare_r
+```
+
+## Python
+
+```{python}
+import numpy as np
+import pandas as pd
+from math import sqrt, erfc, lgamma
+import matplotlib.pyplot as plt
+
+# R에서 전처리한 분석용 데이터를 가져온다.
+teams = pd.DataFrame(r.teams_analysis_py).copy()
+
+numeric_cols = [
+    "yearID", "W", "L", "RS", "RA", "G_binom",
+    "WPct", "log_rs_ra", "log_RA", "log_RS"
+]
+
+for col in numeric_cols:
+    teams[col] = pd.to_numeric(teams[col])
+
+summary_py = pd.DataFrame({
+    "n_team_seasons": [len(teams)],
+    "first_year": [int(teams["yearID"].min())],
+    "last_year": [int(teams["yearID"].max())],
+    "mean_WPct": [teams["WPct"].mean()],
+    "mean_RS": [teams["RS"].mean()],
+    "mean_RA": [teams["RA"].mean()]
+})
+
+summary_py.round(4)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 1. Python에서 사용할 보조 함수
+# ------------------------------------------------------------
+
+def sigmoid(x):
+    x = np.clip(x, -35, 35)
+    return 1 / (1 + np.exp(-x))
+
+
+def golden_section_minimize(func, lower=0.0, upper=5.0, tol=1e-12, max_iter=1000):
+    """
+    One-dimensional minimization by golden-section search.
+    This avoids relying on scipy.optimize.
+    """
+    invphi = (sqrt(5) - 1) / 2
+
+    a = lower
+    b = upper
+    h = b - a
+
+    c = b - invphi * h
+    d = a + invphi * h
+    fc = func(c)
+    fd = func(d)
+
+    for _ in range(max_iter):
+        if abs(b - a) < tol:
+            break
+
+        if fc < fd:
+            b = d
+            d = c
+            fd = fc
+            h = b - a
+            c = b - invphi * h
+            fc = func(c)
+        else:
+            a = c
+            c = d
+            fc = fd
+            h = b - a
+            d = a + invphi * h
+            fd = func(d)
+
+    return (a + b) / 2
+```
+
+```{python}
+# ------------------------------------------------------------
+# 2. 문항 1: Bill James 비선형 모형을 Python에서 직접 적합
+# ------------------------------------------------------------
+
+x_ratio = teams["log_rs_ra"].to_numpy(dtype=float)
+wpct = teams["WPct"].to_numpy(dtype=float)
+
+def bill_james_sse(k):
+    fitted = sigmoid(k * x_ratio)
+    return float(np.sum((wpct - fitted) ** 2))
+
+k_hat_py = golden_section_minimize(
+    bill_james_sse,
+    lower=0.0,
+    upper=5.0
+)
+
+fitted_nls_py = sigmoid(k_hat_py * x_ratio)
+sse_nls_py = np.sum((wpct - fitted_nls_py) ** 2)
+
+# NLS 표준오차: sigma^2 * (J'J)^(-1)
+dmu_dk = x_ratio * fitted_nls_py * (1 - fitted_nls_py)
+sigma2_nls_py = sse_nls_py / (len(wpct) - 1)
+k_se_py = sqrt(sigma2_nls_py / np.sum(dmu_dk ** 2))
+
+nls_table_py = pd.DataFrame({
+    "model": ["1. Bill James NLS"],
+    "parameter": ["k"],
+    "estimate": [k_hat_py],
+    "std_error": [k_se_py],
+    "conf_low": [k_hat_py - 1.96 * k_se_py],
+    "conf_high": [k_hat_py + 1.96 * k_se_py]
+})
+
+nls_table_py.round(4)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 3. Binomial logistic regression IRLS 구현
+# ------------------------------------------------------------
+
+def binomial_deviance_residuals(success, failure, mu):
+    success = np.asarray(success, dtype=float)
+    failure = np.asarray(failure, dtype=float)
+    n = success + failure
+
+    eps = 1e-12
+    mu = np.clip(mu, eps, 1 - eps)
+
+    term_success = np.zeros_like(mu)
+    term_failure = np.zeros_like(mu)
+
+    mask_success = success > 0
+    term_success[mask_success] = (
+        success[mask_success] *
+        np.log(success[mask_success] / (n[mask_success] * mu[mask_success]))
+    )
+
+    mask_failure = failure > 0
+    term_failure[mask_failure] = (
+        failure[mask_failure] *
+        np.log(failure[mask_failure] / (n[mask_failure] * (1 - mu[mask_failure])))
+    )
+
+    deviance_component = 2 * (term_success + term_failure)
+    sign = np.sign(success / n - mu)
+
+    return sign * np.sqrt(deviance_component)
+
+
+def fit_binomial_irls(X, success, failure, max_iter=100, tol=1e-11):
+    """
+    Grouped binomial logistic regression by Newton-Raphson / IRLS.
+    The design matrix X should already contain the desired intercept structure.
+    """
+    X = np.asarray(X, dtype=float)
+    success = np.asarray(success, dtype=float)
+    failure = np.asarray(failure, dtype=float)
+
+    n_trials = success + failure
+    y_prop = success / n_trials
+
+    n_obs, n_params = X.shape
+    beta = np.zeros(n_params)
+
+    for iteration in range(max_iter):
+        eta = X @ beta
+        mu = sigmoid(eta)
+
+        var = np.clip(mu * (1 - mu), 1e-10, None)
+        weights = n_trials * var
+        z = eta + (y_prop - mu) / var
+
+        XtW = X.T * weights
+        hessian = XtW @ X
+        rhs = XtW @ z
+
+        try:
+            beta_new = np.linalg.solve(hessian, rhs)
+        except np.linalg.LinAlgError:
+            beta_new = np.linalg.pinv(hessian) @ rhs
+
+        if np.max(np.abs(beta_new - beta)) < tol:
+            beta = beta_new
+            converged = True
+            break
+
+        beta = beta_new
+    else:
+        converged = False
+
+    eta = X @ beta
+    mu = sigmoid(eta)
+
+    info = (X.T * (n_trials * mu * (1 - mu))) @ X
+    cov = np.linalg.pinv(info)
+    se = np.sqrt(np.diag(cov))
+
+    dev_resid = binomial_deviance_residuals(success, failure, mu)
+    residual_deviance = float(np.sum(dev_resid ** 2))
+    df_residual = n_obs - n_params
+
+    eps = 1e-12
+    log_comb = np.array([
+        lgamma(n + 1) - lgamma(y + 1) - lgamma(n - y + 1)
+        for y, n in zip(success, n_trials)
+    ])
+
+    loglik = np.sum(
+        log_comb +
+        success * np.log(np.clip(mu, eps, 1 - eps)) +
+        failure * np.log(np.clip(1 - mu, eps, 1 - eps))
+    )
+
+    aic = -2 * loglik + 2 * n_params
+
+    return {
+        "beta": beta,
+        "se": se,
+        "cov": cov,
+        "eta": eta,
+        "mu": mu,
+        "deviance_resid": dev_resid,
+        "residual_deviance": residual_deviance,
+        "df_residual": df_residual,
+        "aic": aic,
+        "converged": converged,
+        "n_iter": iteration + 1
+    }
+
+
+def make_coef_table(model_name, terms, beta, se):
+    z_value = beta / se
+    p_value = np.array([erfc(abs(z) / sqrt(2)) for z in z_value])
+
+    return pd.DataFrame({
+        "model": model_name,
+        "term": terms,
+        "estimate": beta,
+        "std_error": se,
+        "z_value": z_value,
+        "p_value": p_value,
+        "conf_low": beta - 1.96 * se,
+        "conf_high": beta + 1.96 * se
+    })
+
+
+def chi_square_sf(x, df):
+    """
+    Chi-square survival function.
+    Uses scipy if available. Otherwise uses Wilson-Hilferty normal approximation.
+    """
+    try:
+        from scipy.stats import chi2
+        return float(chi2.sf(x, df))
+    except Exception:
+        z = ((x / df) ** (1 / 3) - (1 - 2 / (9 * df))) / sqrt(2 / (9 * df))
+        return 0.5 * erfc(z / sqrt(2))
+```
+
+```{python}
+# ------------------------------------------------------------
+# 4. 문항 2: 절편 없는 로지스틱 회귀모형
+#    logit(p) = beta1 * log(RS / RA)
+# ------------------------------------------------------------
+
+wins = teams["W"].to_numpy(dtype=float)
+losses = teams["L"].to_numpy(dtype=float)
+
+X_bill = teams[["log_rs_ra"]].to_numpy(dtype=float)
+
+fit_bill_py = fit_binomial_irls(
+    X=X_bill,
+    success=wins,
+    failure=losses
+)
+
+glm_bill_table_py = make_coef_table(
+    model_name="2. Logistic no-intercept",
+    terms=["log_rs_ra"],
+    beta=fit_bill_py["beta"],
+    se=fit_bill_py["se"]
+)
+
+bill_logistic_table_py = pd.DataFrame({
+    "model": ["2. Logistic no-intercept"],
+    "parameter": ["beta1: log(RS/RA)"],
+    "estimate": [fit_bill_py["beta"][0]],
+    "std_error": [fit_bill_py["se"][0]],
+    "conf_low": [fit_bill_py["beta"][0] - 1.96 * fit_bill_py["se"][0]],
+    "conf_high": [fit_bill_py["beta"][0] + 1.96 * fit_bill_py["se"][0]]
+})
+
+print("IRLS converged:", fit_bill_py["converged"])
+print("Number of iterations:", fit_bill_py["n_iter"])
+print("AIC:", round(fit_bill_py["aic"], 4))
+
+glm_bill_table_py.round(4)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 5. 문항 3: Python에서 모형 진단
+# ------------------------------------------------------------
+
+diag_summary_py = pd.DataFrame({
+    "residual_deviance": [fit_bill_py["residual_deviance"]],
+    "df_residual": [fit_bill_py["df_residual"]],
+    "deviance_df_ratio": [
+        fit_bill_py["residual_deviance"] / fit_bill_py["df_residual"]
+    ],
+    "chi_square_p_value": [
+        chi_square_sf(
+            fit_bill_py["residual_deviance"],
+            fit_bill_py["df_residual"]
+        )
+    ]
+})
+
+diag_summary_py.round(4)
+```
+
+```{python}
+# 진단 1: Deviance residuals vs linear predictors
+
+fig, ax = plt.subplots()
+ax.scatter(fit_bill_py["eta"], fit_bill_py["deviance_resid"], alpha=0.7)
+ax.axhline(0, linestyle="--")
+ax.set_xlabel("Linear predictor eta")
+ax.set_ylabel("Deviance residual")
+ax.set_title("Deviance residuals vs linear predictors")
+plt.show()
+```
+
+```{python}
+# 진단 2: 관측 승률과 예측 승률 비교
+
+fig, ax = plt.subplots()
+ax.scatter(teams["WPct"], fit_bill_py["mu"], alpha=0.7)
+ax.axline((0, 0), slope=1, linestyle="--")
+ax.set_xlabel("Observed WPct")
+ax.set_ylabel("Fitted WPct")
+ax.set_title("Observed WPct vs fitted WPct")
+ax.set_aspect("equal", adjustable="box")
+plt.show()
+```
+
+```{python}
+# ------------------------------------------------------------
+# 6. 문항 4: log(RA), log(RS)를 설명변수로 하는 절편 없는 로지스틱 회귀모형
+# ------------------------------------------------------------
+
+X_logrsra = teams[["log_RA", "log_RS"]].to_numpy(dtype=float)
+
+fit_logrsra_py = fit_binomial_irls(
+    X=X_logrsra,
+    success=wins,
+    failure=losses
+)
+
+glm_logrsra_table_py = make_coef_table(
+    model_name="4. two-predictor logistic",
+    terms=["log_RA", "log_RS"],
+    beta=fit_logrsra_py["beta"],
+    se=fit_logrsra_py["se"]
+)
+
+glm_logrsra_table_py.round(4)
+```
+
+```{python}
+# 문항 4 결과를 k와 비교하기 좋은 형태로 변환한다.
+
+b4_py = fit_logrsra_py["beta"]
+vc4_py = fit_logrsra_py["cov"]
+
+beta_log_ra = b4_py[0]
+beta_log_rs = b4_py[1]
+
+se_beta_log_ra = sqrt(vc4_py[0, 0])
+se_beta_log_rs = sqrt(vc4_py[1, 1])
+
+estimate_avg_k = (beta_log_rs - beta_log_ra) / 2
+se_avg_k = sqrt(
+    (vc4_py[1, 1] + vc4_py[0, 0] - 2 * vc4_py[1, 0]) / 4
+)
+
+model4_transformed_py = pd.DataFrame({
+    "model": ["4. two-predictor logistic"] * 3,
+    "parameter": [
+        "beta_logRS",
+        "-beta_logRA",
+        "(beta_logRS - beta_logRA)/2"
+    ],
+    "estimate": [
+        beta_log_rs,
+        -beta_log_ra,
+        estimate_avg_k
+    ],
+    "std_error": [
+        se_beta_log_rs,
+        se_beta_log_ra,
+        se_avg_k
+    ]
+})
+
+model4_transformed_py["conf_low"] = (
+    model4_transformed_py["estimate"] -
+    1.96 * model4_transformed_py["std_error"]
+)
+
+model4_transformed_py["conf_high"] = (
+    model4_transformed_py["estimate"] +
+    1.96 * model4_transformed_py["std_error"]
+)
+
+model_compare_py = pd.concat(
+    [
+        nls_table_py,
+        bill_logistic_table_py,
+        model4_transformed_py
+    ],
+    ignore_index=True
+)
+
+model_compare_py.round(4)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 7. R과 Python 결과 비교
+# ------------------------------------------------------------
+
+model_compare_r = pd.DataFrame(r.model_compare_r_py).copy()
+
+comparison_language = (
+    model_compare_py
+    .merge(
+        model_compare_r,
+        on=["model", "parameter"],
+        how="inner",
+        suffixes=("_py", "_r")
+    )
+)
+
+comparison_language["abs_estimate_diff"] = np.abs(
+    comparison_language["estimate_py"] -
+    comparison_language["estimate_r"]
+)
+
+comparison_language["abs_se_diff"] = np.abs(
+    comparison_language["std_error_py"] -
+    comparison_language["std_error_r"]
+)
+
+comparison_language.round(8)
+```
+
+:::
+
+### 데이터 랭글링 절차 설명
+
+먼저 Lahman 패키지의 `Teams` 데이터에서 2010년부터 2025년 사이의 자료를 선택하되, 코로나로 인해 단축 시즌이었던 2020년은 제외하였다. 
+`Teams` 데이터의 득점 변수 `R`은 분석에서 `RS`로 이름을 바꾸어 사용하였다. 
+승률은 $begin:math:text$W\/\(W\+L\)$end:math:text$로 계산하였고, 로지스틱 회귀에서는 $begin:math:text$W$end:math:text$를 성공 횟수, $begin:math:text$L$end:math:text$을 실패 횟수로 보는 grouped binomial 모형을 사용하였다.
+
+분석에 사용된 팀-시즌 수는 `r nrow(teams_analysis)`개이다. 
+사용된 연도는 `r paste(sort(unique(teams_analysis$yearID)), collapse = ", ")`이다. 
+`teamID`와 `yearID` 조합의 중복 여부도 확인하였고, 중복된 팀-연도 조합의 수는 `r team_year_check_r$duplicated_team_years`개였다.
+
+### 문항 1 결과 해석
+
+Bill James 비선형 모형
+
+$begin:math:display$
+WPct\_i \= \\frac\{1\}\{1 \+ \(RA\_i \/ RS\_i\)\^k\}
+$end:math:display$
+
+을 비선형 최소제곱법으로 적합한 결과, $begin:math:text$k$end:math:text$의 점추정치는 `r round(bill_james_nls_table_r$estimate, 4)`이다. 
+95% 신뢰구간은 
+\[
+(`r round(bill_james_nls_table_r$conf_low, 4)`,\ 
+ `r round(bill_james_nls_table_r$conf_high, 4)`)
+\]
+이다.
+
+이 값은 득점과 실점의 비율이 승률에 얼마나 강하게 반영되는지를 나타낸다. 
+$begin:math:text$k$end:math:text$가 클수록 득점과 실점의 차이가 승률 차이로 더 급격하게 연결된다.
+
+### 문항 2 결과 해석 및 문항 1과의 비교
+
+두 번째 모형은 절편이 없는 로지스틱 회귀모형이다.
+
+$begin:math:display$
+\\text\{logit\}\(p\_i\)
+\=
+\\beta\_1 \\log \\left\(\\frac\{RS\_i\}\{RA\_i\}\\right\)
+$end:math:display$
+
+이 모형에서 $begin:math:text$\\beta\_1$end:math:text$의 점추정치는 `r round(bill_logistic_table_r$estimate, 4)`이고, 95% 신뢰구간은 
+\[
+(`r round(bill_logistic_table_r$conf_low, 4)`,\ 
+ `r round(bill_logistic_table_r$conf_high, 4)`)
+\]
+이다.
+
+이론적으로 Bill James 모형을 로짓 변환하면
+
+$begin:math:display$
+\\text\{logit\}\(WPct\_i\)
+\=
+k \\log\(RS\_i\/RA\_i\)
+$end:math:display$
+
+가 되므로, 로지스틱 회귀모형의 $begin:math:text$\\beta\_1$end:math:text$은 첫 번째 모형의 $begin:math:text$k$end:math:text$와 거의 같은 의미를 가진다. 
+실제로 두 추정치는 비교표에서 비슷한 값을 보인다. 
+다만 두 추정치가 완전히 같을 필요는 없다. 
+첫 번째 모형은 각 팀-시즌의 승률 오차제곱합을 최소화하는 비선형 최소제곱 모형이고, 두 번째 모형은 승리 횟수 $begin:math:text$W$end:math:text$를 $begin:math:text$W\+L$end:math:text$번의 경기 중 성공 횟수로 보는 이항 로지스틱 회귀모형이기 때문이다. 
+즉, 두 모형은 같은 구조를 공유하지만 목적함수와 오차 가정이 다르다.
+
+### 문항 3 모형 진단
+
+Residual deviance는 `r round(diag_summary_r$residual_deviance, 4)`이고, 잔차 자유도는 `r diag_summary_r$df_residual`이다. 
+Residual deviance를 같은 자유도를 갖는 카이제곱 분포와 비교한 p-value는 `r signif(diag_summary_r$chi_square_p_value, 4)`이다.
+
+`r diag_interpretation_r`
+
+또한 deviance residuals와 linear predictor $begin:math:text$\\eta$end:math:text$의 산점도를 확인하였다. 
+잔차가 0을 중심으로 특별한 곡선 패턴 없이 퍼져 있으면 모형의 체계적인 부적합이 크지 않다고 볼 수 있다. 
+관측 승률과 예측 승률의 산점도에서는 점들이 $begin:math:text$y\=x$end:math:text$ 직선 주변에 가까이 놓일수록 모형이 실제 승률을 잘 예측한다고 볼 수 있다.
+
+### 문항 4 결과 해석
+
+네 번째 모형은 다음과 같은 절편 없는 로지스틱 회귀모형이다.
+
+$begin:math:display$
+\\text\{logit\}\(p\_i\)
+\=
+\\beta\_\{RA\}\\log\(RA\_i\) \+ \\beta\_\{RS\}\\log\(RS\_i\)
+$end:math:display$
+
+두 번째 문항의 모형은
+
+$begin:math:display$
+\\text\{logit\}\(p\_i\)
+\=
+\\beta\_1 \\log\(RS\_i\/RA\_i\)
+\=
+\\beta\_1 \\log\(RS\_i\) \- \\beta\_1 \\log\(RA\_i\)
+$end:math:display$
+
+이므로, 네 번째 모형이 두 번째 모형과 유사하다면 $begin:math:text$\\beta\_\{RS\}$end:math:text$는 양수이고, $begin:math:text$\\beta\_\{RA\}$end:math:text$는 음수이며, 두 계수의 절댓값이 비슷해야 한다. 
+즉, $begin:math:text$\\beta\_\{RS\} \\approx \-\\beta\_\{RA\}$end:math:text$이면 두 모형은 거의 같은 구조를 가진다.
+
+비교표에서 `beta_logRS`, `-beta_logRA`, 그리고 $begin:math:text$\(\\beta\_\{RS\} \- \\beta\_\{RA\}\)\/2$end:math:text$를 함께 제시하였다. 
+$begin:math:text$\(\\beta\_\{RS\} \- \\beta\_\{RA\}\)\/2$end:math:text$는 문항 1의 $begin:math:text$k$end:math:text$ 및 문항 2의 $begin:math:text$\\beta\_1$end:math:text$과 직접 비교하기 위한 요약값이다. 
+이 값이 앞의 두 추정치와 비슷하면, `log(RA)`와 `log(RS)`를 따로 넣은 모형도 Bill James 모형과 유사한 결과를 준다고 해석할 수 있다.
+
+### R과 Python 결과 비교
+
+R에서는 `nls()`와 `glm()`을 사용하여 모형을 적합하였다. 
+Python에서는 같은 분석용 데이터에 대해 비선형 최소제곱의 1차원 최적화와 grouped binomial 로지스틱 회귀의 IRLS 알고리즘을 직접 구현하였다. 
+마지막 비교표의 `abs_estimate_diff`와 `abs_se_diff`는 R과 Python의 추정치 및 표준오차 차이를 보여준다.
+
+두 언어의 결과는 거의 같아야 한다. 
+작은 차이가 있다면 이는 통계적 모형의 차이 때문이 아니라, R의 `nls()`와 `glm()` 내부 알고리즘, Python에서 직접 구현한 최적화 및 IRLS 알고리즘의 수렴 기준, 행렬 역행렬 계산 방식, 부동소수점 연산 차이 때문에 발생한 수치적 차이로 볼 수 있다.
+
+
 ## 문제 2-2
 
 `WPct`를 반응변수로, `logRS`, `logRA`, `H`, `X2B`, `X3B`, `HR`, `BB`, `SO`, `CS`, `HBP`, `SF`, `ERA`, `CG`, `SHO`, `IPouts`, `HA`, `HRA`, `BBA`, `SOA`, `E`, `DP`, `FP`, `SV`를 설명변수로 하는 절편항이 있는 로지스틱 회귀 모형을 적합하고 AIC를 기준으로 하는 단계별(stepwise) 변수선택을 적용하라. 변수선택 후 남은 변수들을 모두 모형에 남길지 일부를 제거할지 다시 판단하라. 최종적으로 선택된 모형을 문제1의 모형과 비교하라. 
 
 ### 답안
+이 문제에서는 문제 2-1과 동일하게 Lahman 패키지의 `Teams` 자료를 사용한다. 
+코로나 단축 시즌인 2020년을 제외하고 2010년부터 2025년까지의 팀-시즌 자료를 분석 대상으로 삼았다. 
+`Teams` 자료는 선수 단위 자료가 아니라 팀 단위 자료이므로, 여기서의 관측단위는 특정 연도의 특정 팀이다. 
+따라서 `teamID`와 `yearID`의 조합이 중복되지 않는지 확인하였다.
+
+반응변수는 승률
+
+$begin:math:display$
+WPct\_i \= \\frac\{W\_i\}\{W\_i \+ L\_i\}
+$end:math:display$
+
+이다. 로지스틱 회귀모형에서는 단순히 `WPct`만을 연속형 반응변수처럼 사용하는 것이 아니라, 각 팀-시즌에서 승리 횟수 `W`를 성공 횟수, 패배 횟수 `L`을 실패 횟수로 보는 grouped binomial 모형을 사용하였다. 
+즉, R에서는 다음과 같은 형태로 모형을 적합한다.
+
+$begin:math:display$
+W\_i \\sim \\text\{Binomial\}\(W\_i \+ L\_i\, p\_i\)\,
+\\qquad
+\\text\{logit\}\(p\_i\) \= \\beta\_0 \+ \\beta\_1 x\_\{i1\} \+ \\cdots \+ \\beta\_p x\_\{ip\}\.
+$end:math:display$
+
+설명변수는 문제에서 제시한 `logRS`, `logRA`, `H`, `X2B`, `X3B`, `HR`, `BB`, `SO`, `CS`, `HBP`, `SF`, `ERA`, `CG`, `SHO`, `IPouts`, `HA`, `HRA`, `BBA`, `SOA`, `E`, `DP`, `FP`, `SV`를 사용하였다. 
+여기서 `logRS = log(R)`이고, `logRA = log(RA)`이다.
+
+::: {.panel-tabset}
+
+## R
+
+```{r}
+library(tidyverse)
+library(Lahman)
+
+# ------------------------------------------------------------
+# 1. 데이터 준비
+# ------------------------------------------------------------
+
+target_years_22 <- setdiff(2010:2025, 2020)
+
+predictor_vars_22 <- c(
+  "logRS", "logRA",
+  "H", "X2B", "X3B", "HR", "BB", "SO", "CS", "HBP", "SF",
+  "ERA", "CG", "SHO", "IPouts", "HA", "HRA", "BBA", "SOA",
+  "E", "DP", "FP", "SV"
+)
+
+required_raw_vars_22 <- c(
+  "yearID", "teamID", "W", "L", "R", "RA",
+  "H", "X2B", "X3B", "HR", "BB", "SO", "CS", "HBP", "SF",
+  "ERA", "CG", "SHO", "IPouts", "HA", "HRA", "BBA", "SOA",
+  "E", "DP", "FP", "SV"
+)
+
+missing_raw_vars_22 <- setdiff(required_raw_vars_22, names(Lahman::Teams))
+
+if (length(missing_raw_vars_22) > 0) {
+  stop(
+    paste(
+      "현재 Lahman::Teams 데이터에 다음 변수가 없습니다:",
+      paste(missing_raw_vars_22, collapse = ", ")
+    )
+  )
+}
+
+teams_22 <- Lahman::Teams %>%
+  as_tibble() %>%
+  filter(yearID %in% target_years_22) %>%
+  transmute(
+    yearID,
+    teamID,
+    W,
+    L,
+    G_binom = W + L,
+    WPct = W / (W + L),
+    RS = R,
+    RA = RA,
+    logRS = log(R),
+    logRA = log(RA),
+    log_rs_ra = log(R / RA),
+    H,
+    X2B,
+    X3B,
+    HR,
+    BB,
+    SO,
+    CS,
+    HBP,
+    SF,
+    ERA,
+    CG,
+    SHO,
+    IPouts,
+    HA,
+    HRA,
+    BBA,
+    SOA,
+    E,
+    DP,
+    FP,
+    SV
+  ) %>%
+  filter(
+    !is.na(W),
+    !is.na(L),
+    !is.na(RS),
+    !is.na(RA),
+    G_binom > 0,
+    WPct > 0,
+    WPct < 1,
+    RS > 0,
+    RA > 0
+  ) %>%
+  drop_na(all_of(predictor_vars_22))
+
+available_years_22 <- sort(unique(teams_22$yearID))
+missing_years_22 <- setdiff(target_years_22, available_years_22)
+
+year_summary_22 <- tibble(
+  requested_years = paste(target_years_22, collapse = ", "),
+  used_years = paste(available_years_22, collapse = ", "),
+  years_not_found_in_Lahman_package = if_else(
+    length(missing_years_22) == 0,
+    "없음",
+    paste(missing_years_22, collapse = ", ")
+  ),
+  n_team_seasons = nrow(teams_22)
+)
+
+knitr::kable(
+  year_summary_22,
+  caption = "문제 2-2 분석에 사용한 연도와 팀-시즌 수"
+)
+
+team_year_check_22 <- teams_22 %>%
+  count(yearID, teamID, name = "rows_per_team_year") %>%
+  summarise(
+    n_team_year_combinations = n(),
+    duplicated_team_years = sum(rows_per_team_year > 1),
+    max_rows_per_team_year = max(rows_per_team_year),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  team_year_check_22,
+  caption = "teamID와 yearID 조합의 중복 여부 확인"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 2. 전체 로지스틱 회귀모형 적합
+# ------------------------------------------------------------
+
+full_formula_22 <- reformulate(
+  predictor_vars_22,
+  response = "cbind(W, L)"
+)
+
+null_formula_22 <- as.formula("cbind(W, L) ~ 1")
+
+full_fit_22 <- glm(
+  full_formula_22,
+  data = teams_22,
+  family = binomial(link = "logit")
+)
+
+make_glm_coef_table_22 <- function(fit) {
+  summary(fit)$coefficients %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("term") %>%
+    as_tibble() %>%
+    transmute(
+      term,
+      estimate = Estimate,
+      std_error = `Std. Error`,
+      z_value = `z value`,
+      p_value = `Pr(>|z|)`,
+      conf_low = Estimate - 1.96 * `Std. Error`,
+      conf_high = Estimate + 1.96 * `Std. Error`
+    )
+}
+
+full_coef_table_22 <- make_glm_coef_table_22(full_fit_22)
+
+full_model_summary_22 <- tibble(
+  model = "Full model",
+  n = nobs(full_fit_22),
+  n_parameters = length(coef(full_fit_22)),
+  AIC = AIC(full_fit_22),
+  residual_deviance = deviance(full_fit_22),
+  df_residual = df.residual(full_fit_22),
+  deviance_df_ratio = deviance(full_fit_22) / df.residual(full_fit_22)
+)
+
+knitr::kable(
+  full_model_summary_22 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "전체 로지스틱 회귀모형 요약"
+)
+
+knitr::kable(
+  full_coef_table_22 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "전체 로지스틱 회귀모형의 회귀계수"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 3. AIC 기준 단계별 변수선택
+# ------------------------------------------------------------
+
+# 문제에서 '절편항이 있는' 모형을 요구했으므로 lower model은 절편만 있는 모형으로 둔다.
+# 시작점은 전체 모형으로 하고, direction = "both"를 사용하여 변수 제거와 재추가를 모두 허용한다.
+
+step_fit_22 <- step(
+  full_fit_22,
+  scope = list(
+    lower = null_formula_22,
+    upper = full_formula_22
+  ),
+  direction = "both",
+  trace = 0
+)
+
+step_selected_vars_22 <- attr(terms(step_fit_22), "term.labels")
+
+paste_terms_22 <- function(x) {
+  if (length(x) == 0) {
+    "(intercept only)"
+  } else {
+    paste(x, collapse = ", ")
+  }
+}
+
+step_selection_summary_22 <- tibble(
+  n_selected_variables = length(step_selected_vars_22),
+  selected_variables = paste_terms_22(step_selected_vars_22),
+  AIC = AIC(step_fit_22),
+  residual_deviance = deviance(step_fit_22),
+  df_residual = df.residual(step_fit_22)
+)
+
+knitr::kable(
+  step_selection_summary_22 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "AIC 기준 단계별 변수선택 결과 요약"
+)
+
+step_path_22 <- step_fit_22$anova %>%
+  as_tibble()
+
+knitr::kable(
+  step_path_22,
+  digits = 4,
+  caption = "step() 함수의 AIC 변수선택 경로"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 4. 변수선택 후 남은 변수들을 모두 유지할지 다시 판단
+# ------------------------------------------------------------
+
+# AIC 기준으로 선택된 모형에서 각 변수를 하나씩 제거했을 때의 AIC 변화를 확인한다.
+# delta_AIC = AIC_if_removed - current_AIC 이다.
+# delta_AIC가 음수이면 해당 변수를 제거하는 것이 AIC를 더 낮춘다는 뜻이다.
+
+current_step_aic_22 <- AIC(step_fit_22)
+
+drop1_step_raw_22 <- drop1(step_fit_22, test = "Chisq") %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("term") %>%
+  as_tibble()
+
+if (!"LRT" %in% names(drop1_step_raw_22)) {
+  drop1_step_raw_22$LRT <- NA_real_
+}
+
+if (!"Pr(>Chi)" %in% names(drop1_step_raw_22)) {
+  drop1_step_raw_22[["Pr(>Chi)"]] <- NA_real_
+}
+
+drop1_step_22 <- drop1_step_raw_22 %>%
+  filter(term != "<none>") %>%
+  transmute(
+    term,
+    Df,
+    deviance_if_removed = Deviance,
+    AIC_if_removed = AIC,
+    delta_AIC = AIC - current_step_aic_22,
+    LRT,
+    p_value = `Pr(>Chi)`
+  ) %>%
+  arrange(delta_AIC)
+
+knitr::kable(
+  drop1_step_22 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "단계별 변수선택 후 단일 변수 제거 검토"
+)
+
+# 최종 판단 기준:
+# 1. 제거했을 때 AIC가 더 낮아지고(delta_AIC <= 0),
+# 2. likelihood ratio test 기준으로도 유의하지 않은 변수(p > 0.10)가 있다면 제거한다.
+# 그렇지 않으면 AIC 선택 결과를 그대로 최종 모형으로 둔다.
+
+manual_remove_terms_22 <- drop1_step_22 %>%
+  filter(!is.na(p_value), p_value > 0.10, delta_AIC <= 0) %>%
+  pull(term)
+
+final_selected_vars_22 <- setdiff(step_selected_vars_22, manual_remove_terms_22)
+
+build_formula_22 <- function(terms_vec) {
+  if (length(terms_vec) == 0) {
+    as.formula("cbind(W, L) ~ 1")
+  } else {
+    reformulate(terms_vec, response = "cbind(W, L)")
+  }
+}
+
+final_formula_22 <- build_formula_22(final_selected_vars_22)
+
+final_fit_22 <- glm(
+  final_formula_22,
+  data = teams_22,
+  family = binomial(link = "logit")
+)
+
+final_decision_text_22 <- if (length(manual_remove_terms_22) == 0) {
+  "단계별 변수선택 후 각 변수를 하나씩 제거해 보았을 때 AIC를 더 낮추는 변수가 없었으므로, AIC 기준으로 선택된 변수들을 모두 최종 모형에 유지하였다."
+} else {
+  paste0(
+    "단계별 변수선택 후 추가 검토에서 ",
+    paste(manual_remove_terms_22, collapse = ", "),
+    " 변수는 제거해도 AIC가 낮아지고 통계적 근거도 약하므로 최종 모형에서 제거하였다."
+  )
+}
+
+final_coef_table_22 <- make_glm_coef_table_22(final_fit_22)
+
+final_selection_summary_22 <- tibble(
+  stepwise_selected_variables = paste_terms_22(step_selected_vars_22),
+  manually_removed_variables = if_else(
+    length(manual_remove_terms_22) == 0,
+    "없음",
+    paste(manual_remove_terms_22, collapse = ", ")
+  ),
+  final_selected_variables = paste_terms_22(final_selected_vars_22),
+  n_final_variables = length(final_selected_vars_22),
+  final_AIC = AIC(final_fit_22)
+)
+
+knitr::kable(
+  final_selection_summary_22 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "최종 변수선택 결과"
+)
+
+knitr::kable(
+  final_coef_table_22 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "최종 로지스틱 회귀모형의 회귀계수"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 5. 문제 2-1의 Bill James 로지스틱 모형과 비교
+# ------------------------------------------------------------
+
+# 문제 2-1에서 사용한 형태:
+# logit(WPct) = beta1 * log(RS / RA)
+# 절편이 없는 grouped binomial logistic regression이다.
+
+problem21_fit_22 <- glm(
+  cbind(W, L) ~ 0 + log_rs_ra,
+  data = teams_22,
+  family = binomial(link = "logit")
+)
+
+make_model_metrics_22 <- function(fit, data, model_name) {
+  pred <- as.numeric(predict(fit, newdata = data, type = "response"))
+
+  tibble(
+    model = model_name,
+    n = nobs(fit),
+    n_parameters = length(coef(fit)),
+    AIC = AIC(fit),
+    residual_deviance = deviance(fit),
+    df_residual = df.residual(fit),
+    deviance_df_ratio = deviance(fit) / df.residual(fit),
+    RMSE_WPct = sqrt(mean((data$WPct - pred)^2)),
+    MAE_WPct = mean(abs(data$WPct - pred))
+  )
+}
+
+model_metrics_22 <- bind_rows(
+  make_model_metrics_22(
+    problem21_fit_22,
+    teams_22,
+    "Problem 2-1 Bill James logistic"
+  ),
+  make_model_metrics_22(
+    full_fit_22,
+    teams_22,
+    "Full model"
+  ),
+  make_model_metrics_22(
+    step_fit_22,
+    teams_22,
+    "AIC stepwise model"
+  ),
+  make_model_metrics_22(
+    final_fit_22,
+    teams_22,
+    "Final selected model"
+  )
+)
+
+knitr::kable(
+  model_metrics_22 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "문제 2-1 모형, 전체 모형, 단계별 선택 모형, 최종 모형 비교"
+)
+
+aic_problem21_22 <- model_metrics_22 %>%
+  filter(model == "Problem 2-1 Bill James logistic") %>%
+  pull(AIC)
+
+aic_final_22 <- model_metrics_22 %>%
+  filter(model == "Final selected model") %>%
+  pull(AIC)
+
+delta_aic_final_vs_problem21_22 <- aic_final_22 - aic_problem21_22
+
+comparison_text_22 <- if (delta_aic_final_vs_problem21_22 < 0) {
+  paste0(
+    "최종 선택 모형의 AIC가 문제 2-1의 Bill James 로지스틱 모형보다 ",
+    round(abs(delta_aic_final_vs_problem21_22), 2),
+    " 낮으므로, 표본 내 적합도 기준에서는 최종 선택 모형이 더 좋은 적합을 보인다."
+  )
+} else if (delta_aic_final_vs_problem21_22 > 0) {
+  paste0(
+    "최종 선택 모형의 AIC가 문제 2-1의 Bill James 로지스틱 모형보다 ",
+    round(delta_aic_final_vs_problem21_22, 2),
+    " 높으므로, AIC 기준에서는 더 단순한 Bill James 로지스틱 모형이 더 유리하다."
+  )
+} else {
+  "두 모형의 AIC가 거의 같으므로, 더 단순한 문제 2-1의 Bill James 로지스틱 모형을 선호할 수 있다."
+}
+
+
+prediction_compare_22 <- teams_22 %>%
+  mutate(
+    fitted_problem21 = as.numeric(
+      predict(problem21_fit_22, newdata = teams_22, type = "response")
+    ),
+    fitted_final = as.numeric(
+      predict(final_fit_22, newdata = teams_22, type = "response")
+    )
+  ) %>%
+  select(yearID, teamID, WPct, fitted_problem21, fitted_final) %>%
+  pivot_longer(
+    cols = c(fitted_problem21, fitted_final),
+    names_to = "model",
+    values_to = "fitted_WPct"
+  ) %>%
+  mutate(
+    model = recode(
+      model,
+      fitted_problem21 = "Problem 2-1 Bill James logistic",
+      fitted_final = "Final selected model"
+    ),
+    model = factor(
+      model,
+      levels = c(
+        "Problem 2-1 Bill James logistic",
+        "Final selected model"
+      )
+    )
+  )
+
+ggplot(prediction_compare_22, aes(x = WPct, y = fitted_WPct)) +
+  geom_point(alpha = 0.65) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~ model) +
+  coord_equal() +
+  labs(
+    x = "Observed WPct",
+    y = "Fitted WPct",
+    title = "Observed vs fitted WPct: Problem 2-1 and final model"
+  ) +
+  theme_minimal(base_family = "sans") +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+
+# Python에서 같은 자료와 R 결과를 사용할 수 있도록 객체 전달
+teams_22_py <- teams_22
+predictor_vars_22_py <- predictor_vars_22
+step_selected_vars_22_py <- step_selected_vars_22
+final_selected_vars_22_py <- final_selected_vars_22
+final_coef_table_22_py <- final_coef_table_22
+model_metrics_22_py <- model_metrics_22
+```
+
+## Python
+
+```{python}
+import numpy as np
+import pandas as pd
+from math import sqrt, erfc, lgamma
+
+# ------------------------------------------------------------
+# 1. R에서 정리한 분석용 데이터 가져오기
+# ------------------------------------------------------------
+
+teams = pd.DataFrame(r.teams_22_py).copy()
+
+predictor_vars = [str(v) for v in list(r.predictor_vars_22_py)]
+r_step_vars = [str(v) for v in list(r.step_selected_vars_22_py)]
+r_final_vars = [str(v) for v in list(r.final_selected_vars_22_py)]
+
+numeric_cols = [
+    "W", "L", "G_binom", "WPct", "RS", "RA", "log_rs_ra"
+] + predictor_vars
+
+for col in numeric_cols:
+    teams[col] = pd.to_numeric(teams[col], errors="coerce")
+
+summary_py_22 = pd.DataFrame({
+    "n_team_seasons": [len(teams)],
+    "first_year": [int(teams["yearID"].min())],
+    "last_year": [int(teams["yearID"].max())],
+    "mean_WPct": [teams["WPct"].mean()],
+    "mean_RS": [teams["RS"].mean()],
+    "mean_RA": [teams["RA"].mean()],
+    "n_predictors_in_full_model": [len(predictor_vars)]
+})
+
+summary_py_22.round(4)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 2. grouped binomial logistic regression을 위한 함수
+# ------------------------------------------------------------
+
+def sigmoid(x):
+    x = np.clip(x, -35, 35)
+    return 1 / (1 + np.exp(-x))
+
+
+def fit_binomial_irls(X, success, failure, max_iter=200, tol=1e-10):
+    """
+    Grouped binomial logistic regression by Newton-Raphson / IRLS.
+
+    success: W
+    failure: L
+    X: design matrix. Intercept column should be included by the caller if needed.
+    """
+    X = np.asarray(X, dtype=float)
+    success = np.asarray(success, dtype=float)
+    failure = np.asarray(failure, dtype=float)
+
+    n_trials = success + failure
+    y_prop = success / n_trials
+
+    n_obs, n_params = X.shape
+    beta = np.zeros(n_params)
+
+    for iteration in range(max_iter):
+        eta = X @ beta
+        mu = sigmoid(eta)
+
+        var = np.clip(mu * (1 - mu), 1e-10, None)
+        weights = n_trials * var
+        z = eta + (y_prop - mu) / var
+
+        XtW = X.T * weights
+        hessian = XtW @ X
+        rhs = XtW @ z
+
+        try:
+            beta_new = np.linalg.solve(hessian, rhs)
+        except np.linalg.LinAlgError:
+            beta_new = np.linalg.pinv(hessian) @ rhs
+
+        if np.max(np.abs(beta_new - beta)) < tol:
+            beta = beta_new
+            converged = True
+            break
+
+        beta = beta_new
+    else:
+        converged = False
+
+    eta = X @ beta
+    mu = sigmoid(eta)
+
+    info = (X.T * (n_trials * mu * (1 - mu))) @ X
+    cov = np.linalg.pinv(info)
+    se = np.sqrt(np.diag(cov))
+
+    eps = 1e-12
+    log_comb = np.array([
+        lgamma(n + 1) - lgamma(y + 1) - lgamma(n - y + 1)
+        for y, n in zip(success, n_trials)
+    ])
+
+    loglik = np.sum(
+        log_comb +
+        success * np.log(np.clip(mu, eps, 1 - eps)) +
+        failure * np.log(np.clip(1 - mu, eps, 1 - eps))
+    )
+
+    aic = -2 * loglik + 2 * n_params
+
+    return {
+        "beta": beta,
+        "se": se,
+        "cov": cov,
+        "eta": eta,
+        "mu": mu,
+        "loglik": loglik,
+        "aic": aic,
+        "converged": converged,
+        "n_iter": iteration + 1,
+        "n_params": n_params
+    }
+
+
+def make_coef_table(terms, beta, se):
+    beta = np.asarray(beta, dtype=float)
+    se = np.asarray(se, dtype=float)
+
+    z_value = beta / se
+    p_value = np.array([erfc(abs(z) / sqrt(2)) for z in z_value])
+
+    return pd.DataFrame({
+        "term": terms,
+        "estimate": beta,
+        "std_error": se,
+        "z_value": z_value,
+        "p_value": p_value,
+        "conf_low": beta - 1.96 * se,
+        "conf_high": beta + 1.96 * se
+    })
+```
+
+```{python}
+# ------------------------------------------------------------
+# 3. Python에서 AIC stepwise 변수선택 구현
+# ------------------------------------------------------------
+
+wins = teams["W"].to_numpy(dtype=float)
+losses = teams["L"].to_numpy(dtype=float)
+observed_wpct = teams["WPct"].to_numpy(dtype=float)
+
+# 수치적 안정성을 위해 Python의 stepwise fitting에서는 설명변수를 표준화한다.
+# 절편이 있는 모형에서는 표준화 전후의 fitted value와 AIC가 동일한 선형공간을 사용하므로
+# 변수선택 결과는 원척도 모형과 직접 비교 가능하다.
+X_raw = teams[predictor_vars].copy()
+means = X_raw.mean(axis=0)
+stds = X_raw.std(axis=0, ddof=0)
+stds = stds.mask(stds == 0, 1.0)
+X_std = (X_raw - means) / stds
+
+_fit_cache = {}
+
+def build_design(var_list):
+    cols = [np.ones(len(teams))]
+    for var in var_list:
+        cols.append(X_std[var].to_numpy(dtype=float))
+    return np.column_stack(cols)
+
+
+def fit_vars(var_list):
+    key = tuple(var_list)
+
+    if key not in _fit_cache:
+        X = build_design(list(var_list))
+        _fit_cache[key] = fit_binomial_irls(X, wins, losses)
+
+    return _fit_cache[key]
+
+
+def stepwise_aic(all_vars, start_vars=None, tol=1e-7, max_steps=100):
+    all_vars = list(all_vars)
+
+    if start_vars is None:
+        current_vars = list(all_vars)
+    else:
+        current_vars = list(start_vars)
+
+    current_fit = fit_vars(current_vars)
+
+    path = [{
+        "step": 0,
+        "action": "start",
+        "variable": "",
+        "n_variables": len(current_vars),
+        "AIC": current_fit["aic"],
+        "selected_variables": ", ".join(current_vars)
+    }]
+
+    for step in range(1, max_steps + 1):
+        candidates = []
+
+        # drop candidates
+        for var in current_vars:
+            new_vars = [v for v in current_vars if v != var]
+            candidates.append(("drop", var, new_vars, fit_vars(new_vars)))
+
+        # add candidates
+        for var in all_vars:
+            if var not in current_vars:
+                new_vars = current_vars + [var]
+                candidates.append(("add", var, new_vars, fit_vars(new_vars)))
+
+        if len(candidates) == 0:
+            break
+
+        best_action, best_var, best_vars, best_fit = min(
+            candidates,
+            key=lambda x: x[3]["aic"]
+        )
+
+        if best_fit["aic"] < current_fit["aic"] - tol:
+            current_vars = best_vars
+            current_fit = best_fit
+
+            path.append({
+                "step": step,
+                "action": best_action,
+                "variable": best_var,
+                "n_variables": len(current_vars),
+                "AIC": current_fit["aic"],
+                "selected_variables": ", ".join(current_vars)
+            })
+        else:
+            break
+
+    return current_vars, current_fit, pd.DataFrame(path)
+
+
+# R과 동일하게 전체 모형에서 시작하여 both 방향 stepwise AIC를 수행한다.
+py_step_vars, py_step_fit, py_step_path = stepwise_aic(
+    predictor_vars,
+    start_vars=predictor_vars
+)
+
+py_step_path[["step", "action", "variable", "n_variables", "AIC"]].round(4)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 4. R의 stepwise 선택 결과와 Python의 stepwise 선택 결과 비교
+# ------------------------------------------------------------
+
+selection_compare_py_22 = pd.DataFrame({
+    "variable": predictor_vars
+})
+
+selection_compare_py_22["selected_by_R_stepwise"] = (
+    selection_compare_py_22["variable"].isin(r_step_vars)
+)
+
+selection_compare_py_22["selected_by_Python_stepwise"] = (
+    selection_compare_py_22["variable"].isin(py_step_vars)
+)
+
+selection_compare_py_22["selected_in_R_final_model"] = (
+    selection_compare_py_22["variable"].isin(r_final_vars)
+)
+
+print("R stepwise selected variables:")
+print(", ".join(r_step_vars) if len(r_step_vars) > 0 else "(intercept only)")
+
+print("\nPython stepwise selected variables:")
+print(", ".join(py_step_vars) if len(py_step_vars) > 0 else "(intercept only)")
+
+selection_compare_py_22
+```
+
+```{python}
+# ------------------------------------------------------------
+# 5. R에서 최종 선택한 변수들을 사용하여 Python에서도 같은 최종 모형 적합
+# ------------------------------------------------------------
+
+final_fit_py = fit_vars(r_final_vars)
+
+def transform_standardized_to_raw(fit, var_list):
+    """
+    Standardized predictors로 적합한 계수를 원래 변수 척도의 계수로 변환한다.
+    """
+    var_list = list(var_list)
+    p = len(var_list) + 1
+
+    beta_std = fit["beta"]
+    cov_std = fit["cov"]
+
+    T = np.zeros((p, p))
+    T[0, 0] = 1.0
+
+    for j, var in enumerate(var_list, start=1):
+        mean_j = float(means[var])
+        sd_j = float(stds[var])
+
+        T[0, j] = -mean_j / sd_j
+        T[j, j] = 1.0 / sd_j
+
+    beta_raw = T @ beta_std
+    cov_raw = T @ cov_std @ T.T
+    se_raw = np.sqrt(np.diag(cov_raw))
+
+    return beta_raw, se_raw, cov_raw
+
+
+beta_final_raw_py, se_final_raw_py, cov_final_raw_py = transform_standardized_to_raw(
+    final_fit_py,
+    r_final_vars
+)
+
+coef_final_py_22 = make_coef_table(
+    terms=["(Intercept)"] + r_final_vars,
+    beta=beta_final_raw_py,
+    se=se_final_raw_py
+)
+
+coef_final_py_22.round(6)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 6. R과 Python의 최종 모형 회귀계수 비교
+# ------------------------------------------------------------
+
+coef_final_r_22 = pd.DataFrame(r.final_coef_table_22_py).copy()
+
+coef_compare_language_22 = (
+    coef_final_py_22[["term", "estimate", "std_error"]]
+    .rename(columns={
+        "estimate": "estimate_py",
+        "std_error": "std_error_py"
+    })
+    .merge(
+        coef_final_r_22[["term", "estimate", "std_error"]],
+        on="term",
+        how="inner"
+    )
+    .rename(columns={
+        "estimate": "estimate_r",
+        "std_error": "std_error_r"
+    })
+)
+
+coef_compare_language_22["abs_estimate_diff"] = np.abs(
+    coef_compare_language_22["estimate_py"] -
+    coef_compare_language_22["estimate_r"]
+)
+
+coef_compare_language_22["abs_se_diff"] = np.abs(
+    coef_compare_language_22["std_error_py"] -
+    coef_compare_language_22["std_error_r"]
+)
+
+coef_compare_language_22.round(8)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 7. Python에서도 문제 2-1 모형과 최종 선택 모형 비교
+# ------------------------------------------------------------
+
+# 문제 2-1 모형: intercept 없이 log(RS / RA)만 사용
+X_problem21_py = teams[["log_rs_ra"]].to_numpy(dtype=float)
+
+problem21_fit_py = fit_binomial_irls(
+    X_problem21_py,
+    wins,
+    losses
+)
+
+full_fit_py = fit_vars(predictor_vars)
+
+def metrics_from_fit(fit, model_name):
+    fitted = fit["mu"]
+
+    return {
+        "model": model_name,
+        "n_parameters": fit["n_params"],
+        "AIC": fit["aic"],
+        "RMSE_WPct": np.sqrt(np.mean((observed_wpct - fitted) ** 2)),
+        "MAE_WPct": np.mean(np.abs(observed_wpct - fitted)),
+        "converged": fit["converged"],
+        "n_iter": fit["n_iter"]
+    }
+
+
+model_metrics_py_22 = pd.DataFrame([
+    metrics_from_fit(problem21_fit_py, "Problem 2-1 Bill James logistic"),
+    metrics_from_fit(full_fit_py, "Full model"),
+    metrics_from_fit(py_step_fit, "Python AIC stepwise model"),
+    metrics_from_fit(final_fit_py, "R final selected model refit in Python")
+])
+
+model_metrics_py_22.round(4)
+```
+```{python}
+# ------------------------------------------------------------
+# 8. Python 결과 요약: R stepwise, Python stepwise, 최종 모형 변수 비교
+# ------------------------------------------------------------
+
+selection_summary_22 = pd.DataFrame({
+    "item": [
+        "R stepwise selected variables",
+        "R final selected variables",
+        "Python stepwise selected variables"
+    ],
+    "variables": [
+        ", ".join(r_step_vars) if len(r_step_vars) > 0 else "(intercept only)",
+        ", ".join(r_final_vars) if len(r_final_vars) > 0 else "(intercept only)",
+        ", ".join(py_step_vars) if len(py_step_vars) > 0 else "(intercept only)"
+    ],
+    "n_variables": [
+        len(r_step_vars),
+        len(r_final_vars),
+        len(py_step_vars)
+    ]
+})
+
+selection_summary_22
+```
+```{python}
+# ------------------------------------------------------------
+# 9. R에서 최종 선택한 변수집합을 Python에서 재적합한 결과
+# ------------------------------------------------------------
+
+coef_final_py_22.round(4)
+```
+```{python}
+# ------------------------------------------------------------
+# 10. R 최종 모형과 Python 재적합 최종 모형의 계수 비교
+# ------------------------------------------------------------
+
+coef_compare_language_22.round(8)
+```
+```{python}
+# ------------------------------------------------------------
+# 11. Python 기준 문제 2-1 모형과 최종 선택 모형 비교
+# ------------------------------------------------------------
+
+# 문제 2-1 모형: intercept 없이 log(RS / RA)만 사용
+X_problem21_py = teams[["log_rs_ra"]].to_numpy(dtype=float)
+
+problem21_fit_py = fit_binomial_irls(
+    X_problem21_py,
+    wins,
+    losses
+)
+
+# R에서 최종 선택한 변수집합으로 Python에서 재적합한 최종 모형
+final_fit_py = fit_vars(r_final_vars)
+
+def metrics_from_fit_22(fit, model_name):
+    fitted = fit["mu"]
+
+    return {
+        "model": model_name,
+        "n_parameters": fit["n_params"],
+        "AIC": fit["aic"],
+        "RMSE_WPct": np.sqrt(np.mean((observed_wpct - fitted) ** 2)),
+        "MAE_WPct": np.mean(np.abs(observed_wpct - fitted)),
+        "converged": fit["converged"],
+        "n_iter": fit["n_iter"]
+    }
+
+model_metrics_py_22_fixed = pd.DataFrame([
+    metrics_from_fit_22(
+        problem21_fit_py,
+        "Problem 2-1 Bill James logistic"
+    ),
+    metrics_from_fit_22(
+        final_fit_py,
+        "Final selected model refit in Python"
+    )
+])
+
+model_metrics_py_22_fixed.round(4)
+```
+```{python}
+# ------------------------------------------------------------
+# 12. Python 그래프: observed WPct vs fitted WPct
+# ------------------------------------------------------------
+
+import matplotlib.pyplot as plt
+
+prediction_compare_py_22 = pd.concat(
+    [
+        pd.DataFrame({
+            "WPct": observed_wpct,
+            "fitted_WPct": problem21_fit_py["mu"],
+            "model": "Problem 2-1 Bill James logistic"
+        }),
+        pd.DataFrame({
+            "WPct": observed_wpct,
+            "fitted_WPct": final_fit_py["mu"],
+            "model": "Final selected model"
+        })
+    ],
+    ignore_index=True
+)
+
+model_order_22 = [
+    "Problem 2-1 Bill James logistic",
+    "Final selected model"
+]
+
+x_min = prediction_compare_py_22["WPct"].min()
+x_max = prediction_compare_py_22["WPct"].max()
+y_min = prediction_compare_py_22["fitted_WPct"].min()
+y_max = prediction_compare_py_22["fitted_WPct"].max()
+
+plot_min = min(x_min, y_min)
+plot_max = max(x_max, y_max)
+
+fig, axes = plt.subplots(
+    1,
+    2,
+    figsize=(8, 4),
+    sharex=True,
+    sharey=True
+)
+
+for ax, model_name in zip(axes, model_order_22):
+    plot_data = prediction_compare_py_22[
+        prediction_compare_py_22["model"] == model_name
+    ]
+
+    ax.scatter(
+        plot_data["WPct"],
+        plot_data["fitted_WPct"],
+        alpha=0.65
+    )
+
+    ax.plot(
+        [plot_min, plot_max],
+        [plot_min, plot_max],
+        linestyle="--"
+    )
+
+    ax.set_title(model_name)
+    ax.set_xlabel("Observed WPct")
+    ax.set_ylabel("Fitted WPct")
+    ax.grid(True, alpha=0.3)
+
+fig.suptitle("Observed vs fitted WPct: Problem 2-1 and final model")
+fig.tight_layout()
+
+plt.show()
+```
+:::
+
+### 데이터 랭글링 절차 설명
+
+먼저 Lahman 패키지의 `Teams` 데이터에서 2010년부터 2025년까지의 자료를 선택하되, 코로나 단축 시즌인 2020년은 제외하였다. 
+다만 사용하는 Lahman 패키지 버전에 따라 2025년 자료가 아직 포함되어 있지 않을 수 있으므로, 실제로 사용된 연도와 누락된 연도를 표로 확인하였다. 
+분석에 사용된 팀-시즌 수는 `r nrow(teams_22)`개이다. 
+사용된 연도는 `r paste(sort(unique(teams_22$yearID)), collapse = ", ")`이다.
+
+`Teams` 데이터에서 득점은 `R`, 실점은 `RA`로 저장되어 있다. 
+문제에서 요구한 `logRS`와 `logRA`를 만들기 위해 `logRS = log(R)`, `logRA = log(RA)`로 변환하였다. 
+승률 `WPct`는 `W / (W + L)`로 계산하였다. 
+로지스틱 회귀모형에서는 `WPct` 자체를 단순한 연속형 반응변수로 보지 않고, `W`를 성공 횟수, `L`을 실패 횟수로 보는 grouped binomial 모형을 사용하였다. 
+이는 각 팀-시즌이 서로 다른 승률을 갖는 이항 시행의 결과라고 보는 방식이다.
+
+### 전체 모형과 단계별 변수선택 결과
+
+처음에는 문제에서 제시한 모든 설명변수를 포함한 절편항이 있는 로지스틱 회귀모형을 적합하였다. 
+그다음 R에서는 `step()` 함수를 사용하여 AIC 기준의 양방향 단계별 변수선택을 수행하였다. 
+Python에서는 같은 분석용 데이터를 사용하고, grouped binomial logistic regression의 IRLS 알고리즘과 AIC 기준 stepwise search를 직접 구현하였다.
+
+R의 AIC 기준 단계별 변수선택 결과 선택된 변수는 다음과 같다.
+
+`r paste_terms_22(step_selected_vars_22)`
+
+단계별 변수선택 후에는 선택된 변수들을 무조건 모두 최종 모형에 넣지 않고, 각 변수를 하나씩 제거했을 때 AIC가 어떻게 변하는지 확인하였다. 
+`delta_AIC`는 해당 변수를 제거했을 때의 AIC에서 현재 단계별 선택 모형의 AIC를 뺀 값이다. 
+따라서 `delta_AIC`가 음수이면 그 변수를 제거하는 편이 AIC를 더 낮춘다는 뜻이고, 양수이면 그 변수를 유지하는 편이 AIC 기준에서 더 좋다는 뜻이다.
+
+`r final_decision_text_22`
+
+최종 선택된 변수는 다음과 같다.
+
+`r paste_terms_22(final_selected_vars_22)`
+
+### 최종 모형 해석
+
+최종 로지스틱 회귀모형의 회귀계수는 로그 오즈 단위이다. 
+즉, 어떤 설명변수의 계수가 양수이면 다른 변수들이 고정되어 있을 때 그 변수가 증가할수록 승리 확률의 로짓이 증가하는 방향으로 관련되어 있음을 의미한다. 
+반대로 계수가 음수이면 해당 변수가 증가할수록 승리 확률의 로짓이 감소하는 방향으로 관련되어 있음을 의미한다.
+
+다만 이 모형에는 득점, 실점, 타격, 투구, 수비 관련 변수들이 동시에 많이 포함되어 있으므로, 개별 회귀계수의 부호는 단순한 상관관계와 다를 수 있다. 
+예를 들어 `HR`의 단순 효과는 승률과 양의 관계를 가질 수 있지만, `H`, `X2B`, `X3B`, `BB`, `logRS` 등 다른 공격 지표를 동시에 통제하면 회귀계수의 의미는 “다른 공격 지표가 같은 상황에서 HR만 증가하는 경우”에 대한 조건부 효과가 된다. 
+따라서 이 문제에서는 개별 계수 하나하나의 인과적 해석보다는, AIC 기준으로 어떤 변수들이 예측에 추가적인 정보를 제공하는지에 초점을 두는 것이 적절하다.
+
+### 문제 2-1 모형과의 비교
+
+문제 2-1의 Bill James 로지스틱 모형은 다음과 같은 매우 단순한 구조를 가진다.
+
+$begin:math:display$
+\\text\{logit\}\(p\_i\) \= \\beta\_1 \\log\(RS\_i \/ RA\_i\)
+$end:math:display$
+
+반면 문제 2-2의 최종 모형은 득점과 실점의 로그값뿐 아니라 타격, 투구, 수비 관련 여러 변수를 함께 사용한다. 
+따라서 문제 2-2의 최종 모형은 문제 2-1 모형보다 훨씬 유연하지만, 그만큼 모형이 복잡해진다.
+
+AIC 기준 비교 결과는 다음과 같이 요약된다.
+
+`r comparison_text_22`
+
+RMSE와 MAE도 함께 비교하였다. 
+이 값들은 관측된 승률과 모형이 예측한 승률 사이의 차이를 측정한다. 
+RMSE 또는 MAE가 작을수록 표본 내 예측 성능이 좋다고 볼 수 있다. 
+일반적으로 최종 선택 모형은 더 많은 정보를 사용하기 때문에 표본 내 예측 성능은 문제 2-1의 단순 Bill James 모형보다 좋아질 가능성이 크다. 
+하지만 해석 가능성과 단순성 측면에서는 문제 2-1 모형이 더 장점이 있다.
+
+### R과 Python 결과 비교
+
+R에서는 `glm()`과 `step()`을 사용하여 grouped binomial logistic regression과 AIC 기준 단계별 변수선택을 수행하였다. 
+Python에서는 같은 데이터를 사용하되, 로지스틱 회귀의 IRLS 알고리즘과 AIC 기준 단계별 탐색을 직접 구현하였다. 
+Python에서는 수치적 안정성을 위해 설명변수를 표준화한 뒤 모형을 적합했고, 최종 회귀계수는 다시 원래 변수 척도로 변환하였다.
+
+R과 Python의 최종 모형 계수 비교표에서 `abs_estimate_diff`와 `abs_se_diff`가 매우 작으면 두 언어에서 사실상 같은 결과를 얻었다고 볼 수 있다. 
+작은 차이가 있다면 이는 통계적 모형의 차이가 아니라, R의 `glm()` 및 `step()` 구현과 Python에서 직접 구현한 IRLS 및 stepwise 알고리즘의 수렴 기준, 행렬 계산 방식, 부동소수점 연산 차이에서 비롯된 수치적 차이이다.
+
+만약 R과 Python의 stepwise 선택 변수가 일부 다르게 나온다면, 이는 AIC가 거의 비슷한 후보 모형들이 여럿 있을 때 탐색 순서나 동률 처리 방식이 다르기 때문에 발생할 수 있다. 
+이 경우에는 최종적으로 R에서 선택한 모형을 기준으로 Python에서 같은 변수 집합을 다시 적합하여 회귀계수와 예측값이 일치하는지 확인하는 것이 더 직접적인 비교가 된다.
+
+Python에서는 두 가지 결과를 함께 확인하였다. 
+첫째, Python에서 직접 구현한 AIC stepwise 변수선택 결과를 R의 `step()` 결과와 비교하였다. 
+둘째, 최종 모형의 계수와 예측값을 정확히 비교하기 위해 R에서 최종 선택한 변수집합을 Python에서 다시 적합하였다.
+
+R과 Python의 독립적인 stepwise 변수선택 결과는 일부 다를 수 있다. 
+그 이유는 단계별 변수선택이 전역 최적화가 아니라 탐욕적 탐색 절차이고, 후보 모형의 평가 순서, AIC 값이 거의 같은 경우의 동률 처리, IRLS 알고리즘의 수렴 기준, 부동소수점 계산 방식에 따라 선택 경로가 달라질 수 있기 때문이다. 
+따라서 최종적인 R-Python 계수 비교에서는 R에서 최종 선택한 변수집합을 Python에서 같은 grouped binomial logistic regression으로 재적합한 결과를 기준으로 하였다.
+
+이 기준으로 비교하면 R과 Python의 회귀계수 및 표준오차 차이는 매우 작아야 한다. 
+즉, 같은 데이터와 같은 변수집합을 사용하면 두 언어의 최종 모형 결과는 실질적으로 동일하다고 볼 수 있다. 
+반면 독립적인 stepwise 선택 결과가 다소 다르다면, 이는 모형 자체의 통계적 차이라기보다 변수선택 알고리즘의 탐색 경로 차이로 해석하는 것이 적절하다.
+
 
 ## 문제 2-3
 
@@ -113,6 +2918,1895 @@ $$
 2.  `W`를 반응변수로 하여 문제2의 분석을 실시하되 음이항 회귀모형을 사용하라. 모형 적합 시 오류가 발생하면 이유를 파악해서 보고하라.
 
 ### 답안
+이 문제에서는 문제 2-2와 같은 설명변수 집합을 사용하되, 반응변수를 승률 `WPct`가 아니라 승리 횟수 `W`로 바꾸어 분석한다. 
+승리 횟수는 count variable이므로 먼저 포아송 회귀모형을 적합하고, 그다음 포아송 모형의 평균-분산 동일성 가정을 완화하는 음이항 회귀모형을 적합한다.
+
+다만 팀마다 경기 수 `W + L`이 완전히 같지 않을 수 있으므로, 단순히 `W`만 모형화하면 경기 수가 많은 팀이 더 많은 승리를 얻는 구조가 반영되지 않는다. 
+따라서 포아송 회귀와 음이항 회귀에서는 다음과 같이 `log(W + L)`을 offset으로 포함하였다.
+
+$begin:math:display$
+W\_i \\sim \\text\{Poisson\}\(\\mu\_i\)\,
+\\qquad
+\\log\(\\mu\_i\)
+\=
+\\log\(W\_i \+ L\_i\) \+ \\eta\_i\.
+$end:math:display$
+
+이때 $begin:math:text$\\eta\_i$end:math:text$는 승률 또는 승리율에 해당하는 부분을 설명하는 선형예측자이다. 
+즉, offset을 사용하면 모형은 승리 횟수 자체라기보다 경기 수를 보정한 승리율을 설명하게 되므로, 문제 2-2의 로지스틱 회귀모형과 비교하기 더 자연스럽다.
+
+설명변수는 문제 2-2와 동일하게 `logRS`, `logRA`, `H`, `X2B`, `X3B`, `HR`, `BB`, `SO`, `CS`, `HBP`, `SF`, `ERA`, `CG`, `SHO`, `IPouts`, `HA`, `HRA`, `BBA`, `SOA`, `E`, `DP`, `FP`, `SV`를 사용하였다.
+
+::: {.panel-tabset}
+
+## R
+
+```{r}
+library(tidyverse)
+library(Lahman)
+
+# ------------------------------------------------------------
+# 1. 데이터 준비
+# ------------------------------------------------------------
+
+target_years_23 <- setdiff(2010:2025, 2020)
+
+predictor_vars_23 <- c(
+  "logRS", "logRA",
+  "H", "X2B", "X3B", "HR", "BB", "SO", "CS", "HBP", "SF",
+  "ERA", "CG", "SHO", "IPouts", "HA", "HRA", "BBA", "SOA",
+  "E", "DP", "FP", "SV"
+)
+
+required_raw_vars_23 <- c(
+  "yearID", "teamID", "W", "L", "R", "RA",
+  "H", "X2B", "X3B", "HR", "BB", "SO", "CS", "HBP", "SF",
+  "ERA", "CG", "SHO", "IPouts", "HA", "HRA", "BBA", "SOA",
+  "E", "DP", "FP", "SV"
+)
+
+missing_raw_vars_23 <- setdiff(required_raw_vars_23, names(Lahman::Teams))
+
+if (length(missing_raw_vars_23) > 0) {
+  stop(
+    paste(
+      "현재 Lahman::Teams 데이터에 다음 변수가 없습니다:",
+      paste(missing_raw_vars_23, collapse = ", ")
+    )
+  )
+}
+
+teams_23 <- Lahman::Teams %>%
+  as_tibble() %>%
+  filter(yearID %in% target_years_23) %>%
+  transmute(
+    yearID,
+    teamID,
+    W,
+    L,
+    G_binom = W + L,
+    WPct = W / (W + L),
+    RS = R,
+    RA = RA,
+    logRS = log(R),
+    logRA = log(RA),
+    log_rs_ra = log(R / RA),
+    H,
+    X2B,
+    X3B,
+    HR,
+    BB,
+    SO,
+    CS,
+    HBP,
+    SF,
+    ERA,
+    CG,
+    SHO,
+    IPouts,
+    HA,
+    HRA,
+    BBA,
+    SOA,
+    E,
+    DP,
+    FP,
+    SV
+  ) %>%
+  filter(
+    !is.na(W),
+    !is.na(L),
+    !is.na(RS),
+    !is.na(RA),
+    G_binom > 0,
+    WPct > 0,
+    WPct < 1,
+    RS > 0,
+    RA > 0
+  ) %>%
+  drop_na(all_of(predictor_vars_23))
+
+available_years_23 <- sort(unique(teams_23$yearID))
+missing_years_23 <- setdiff(target_years_23, available_years_23)
+
+year_summary_23 <- tibble(
+  requested_years = paste(target_years_23, collapse = ", "),
+  used_years = paste(available_years_23, collapse = ", "),
+  years_not_found_in_Lahman_package = if (length(missing_years_23) == 0) {
+    "없음"
+  } else {
+    paste(missing_years_23, collapse = ", ")
+  },
+  n_team_seasons = nrow(teams_23)
+)
+
+knitr::kable(
+  year_summary_23,
+  caption = "문제 2-3 분석에 사용한 연도와 팀-시즌 수"
+)
+
+team_year_check_23 <- teams_23 %>%
+  count(yearID, teamID, name = "rows_per_team_year") %>%
+  summarise(
+    n_team_year_combinations = n(),
+    duplicated_team_years = sum(rows_per_team_year > 1),
+    max_rows_per_team_year = max(rows_per_team_year),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  team_year_check_23,
+  caption = "teamID와 yearID 조합의 중복 여부 확인"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 2. 공통 함수 정의
+# ------------------------------------------------------------
+
+fmt_terms_23 <- function(x) {
+  if (length(x) == 0) {
+    "(intercept only)"
+  } else {
+    paste(x, collapse = ", ")
+  }
+}
+
+make_count_formula_23 <- function(vars) {
+  if (length(vars) == 0) {
+    as.formula("W ~ 1 + offset(log(G_binom))")
+  } else {
+    reformulate(
+      c(vars, "offset(log(G_binom))"),
+      response = "W"
+    )
+  }
+}
+
+make_logit_formula_23 <- function(vars) {
+  if (length(vars) == 0) {
+    as.formula("cbind(W, L) ~ 1")
+  } else {
+    reformulate(
+      vars,
+      response = "cbind(W, L)"
+    )
+  }
+}
+
+make_coef_table_23 <- function(fit) {
+  summary(fit)$coefficients %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("term") %>%
+    as_tibble() %>%
+    transmute(
+      term,
+      estimate = Estimate,
+      std_error = `Std. Error`,
+      z_value = `z value`,
+      p_value = `Pr(>|z|)`,
+      conf_low = Estimate - 1.96 * `Std. Error`,
+      conf_high = Estimate + 1.96 * `Std. Error`
+    )
+}
+
+make_drop1_table_23 <- function(fit) {
+  current_aic <- AIC(fit)
+
+  drop1_raw <- drop1(fit, test = "Chisq") %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("term") %>%
+    as_tibble()
+
+  if (!"LRT" %in% names(drop1_raw)) {
+    drop1_raw$LRT <- NA_real_
+  }
+
+  if (!"Pr(>Chi)" %in% names(drop1_raw)) {
+    drop1_raw[["Pr(>Chi)"]] <- NA_real_
+  }
+
+  drop1_raw %>%
+    filter(term != "<none>") %>%
+    transmute(
+      term,
+      Df,
+      deviance_if_removed = Deviance,
+      AIC_if_removed = AIC,
+      delta_AIC = AIC - current_aic,
+      LRT,
+      p_value = `Pr(>Chi)`
+    ) %>%
+    arrange(delta_AIC)
+}
+
+safe_eval_23 <- function(expr) {
+  warnings_seen <- character()
+
+  value <- tryCatch(
+    withCallingHandlers(
+      expr,
+      warning = function(w) {
+        warnings_seen <<- c(warnings_seen, conditionMessage(w))
+        invokeRestart("muffleWarning")
+      }
+    ),
+    error = function(e) e
+  )
+
+  ok <- !inherits(value, "error")
+
+  list(
+    ok = ok,
+    value = if (ok) value else NULL,
+    error = if (ok) NA_character_ else conditionMessage(value),
+    warnings = unique(warnings_seen)
+  )
+}
+
+safe_message_23 <- function(x) {
+  if (!x$ok) {
+    paste0("오류: ", x$error)
+  } else if (length(x$warnings) > 0) {
+    paste0("성공; warning: ", paste(x$warnings, collapse = " | "))
+  } else {
+    "성공"
+  }
+}
+```
+
+```{r}
+# ------------------------------------------------------------
+# 3. 문제 2-2와 비교할 로지스틱 회귀모형 재적합
+# ------------------------------------------------------------
+# 문제 2-2와 같은 grouped binomial logistic regression을 다시 적합한다.
+# 이 모형은 W를 성공 횟수, L을 실패 횟수로 보는 모형이다.
+
+full_logit_formula_23 <- make_logit_formula_23(predictor_vars_23)
+null_logit_formula_23 <- make_logit_formula_23(character(0))
+
+full_logit_fit_23 <- glm(
+  full_logit_formula_23,
+  data = teams_23,
+  family = binomial(link = "logit")
+)
+
+step_logit_fit_23 <- step(
+  full_logit_fit_23,
+  scope = list(
+    lower = null_logit_formula_23,
+    upper = full_logit_formula_23
+  ),
+  direction = "both",
+  trace = 0
+)
+
+logit_step_vars_23 <- attr(terms(step_logit_fit_23), "term.labels")
+
+drop1_logit_23 <- make_drop1_table_23(step_logit_fit_23)
+
+logit_manual_remove_terms_23 <- drop1_logit_23 %>%
+  filter(!is.na(p_value), p_value > 0.10, delta_AIC <= 0) %>%
+  pull(term)
+
+logit_final_vars_23 <- setdiff(logit_step_vars_23, logit_manual_remove_terms_23)
+
+final_logit_fit_23 <- glm(
+  make_logit_formula_23(logit_final_vars_23),
+  data = teams_23,
+  family = binomial(link = "logit")
+)
+
+logit_final_coef_23 <- make_coef_table_23(final_logit_fit_23)
+
+logit_final_vars_text_23 <- fmt_terms_23(logit_final_vars_23)
+
+knitr::kable(
+  tibble(
+    model = "Problem 2-2 logistic model refit",
+    selected_variables = logit_final_vars_text_23,
+    n_selected_variables = length(logit_final_vars_23),
+    AIC = AIC(final_logit_fit_23),
+    residual_deviance = deviance(final_logit_fit_23),
+    df_residual = df.residual(final_logit_fit_23)
+  ) %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "문제 2-2 로지스틱 회귀모형 재적합 결과"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 4. 포아송 회귀모형: 전체 모형 적합
+# ------------------------------------------------------------
+
+full_count_formula_23 <- make_count_formula_23(predictor_vars_23)
+null_count_formula_23 <- make_count_formula_23(character(0))
+
+full_pois_fit_23 <- glm(
+  full_count_formula_23,
+  data = teams_23,
+  family = poisson(link = "log")
+)
+
+full_pois_coef_23 <- make_coef_table_23(full_pois_fit_23)
+
+full_pois_summary_23 <- tibble(
+  model = "Full Poisson model",
+  n = nobs(full_pois_fit_23),
+  n_parameters = as.numeric(attr(logLik(full_pois_fit_23), "df")),
+  AIC = AIC(full_pois_fit_23),
+  residual_deviance = deviance(full_pois_fit_23),
+  df_residual = df.residual(full_pois_fit_23),
+  deviance_df_ratio = deviance(full_pois_fit_23) / df.residual(full_pois_fit_23),
+  pearson_chisq = sum(residuals(full_pois_fit_23, type = "pearson")^2),
+  pearson_df_ratio = pearson_chisq / df_residual
+)
+
+knitr::kable(
+  full_pois_summary_23 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "전체 포아송 회귀모형 요약"
+)
+
+knitr::kable(
+  full_pois_coef_23 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "전체 포아송 회귀모형의 회귀계수"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 5. 포아송 회귀모형: AIC 기준 단계별 변수선택
+# ------------------------------------------------------------
+
+step_pois_fit_23 <- step(
+  full_pois_fit_23,
+  scope = list(
+    lower = null_count_formula_23,
+    upper = full_count_formula_23
+  ),
+  direction = "both",
+  trace = 0
+)
+
+poisson_step_vars_23 <- attr(terms(step_pois_fit_23), "term.labels") %>%
+  setdiff("offset(log(G_binom))")
+
+poisson_step_vars_text_23 <- fmt_terms_23(poisson_step_vars_23)
+
+step_pois_summary_23 <- tibble(
+  model = "AIC stepwise Poisson model",
+  selected_variables = poisson_step_vars_text_23,
+  n_selected_variables = length(poisson_step_vars_23),
+  AIC = AIC(step_pois_fit_23),
+  residual_deviance = deviance(step_pois_fit_23),
+  df_residual = df.residual(step_pois_fit_23),
+  deviance_df_ratio = deviance(step_pois_fit_23) / df.residual(step_pois_fit_23),
+  pearson_chisq = sum(residuals(step_pois_fit_23, type = "pearson")^2),
+  pearson_df_ratio = pearson_chisq / df_residual
+)
+
+knitr::kable(
+  step_pois_summary_23 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "AIC 기준 포아송 단계별 변수선택 결과"
+)
+
+knitr::kable(
+  step_pois_fit_23$anova %>%
+    as_tibble(),
+  digits = 4,
+  caption = "포아송 회귀모형 step() 변수선택 경로"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 6. 포아송 단계별 선택 후 남은 변수 재검토
+# ------------------------------------------------------------
+
+drop1_pois_23 <- make_drop1_table_23(step_pois_fit_23)
+
+knitr::kable(
+  drop1_pois_23 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "포아송 단계별 변수선택 후 단일 변수 제거 검토"
+)
+
+poisson_manual_remove_terms_23 <- drop1_pois_23 %>%
+  filter(!is.na(p_value), p_value > 0.10, delta_AIC <= 0) %>%
+  pull(term)
+
+poisson_final_vars_23 <- setdiff(poisson_step_vars_23, poisson_manual_remove_terms_23)
+
+if (length(poisson_manual_remove_terms_23) == 0) {
+  final_pois_fit_23 <- step_pois_fit_23
+} else {
+  final_pois_fit_23 <- glm(
+    make_count_formula_23(poisson_final_vars_23),
+    data = teams_23,
+    family = poisson(link = "log")
+  )
+}
+
+poisson_final_coef_23 <- make_coef_table_23(final_pois_fit_23)
+poisson_final_vars_text_23 <- fmt_terms_23(poisson_final_vars_23)
+
+poisson_final_decision_text_23 <- if (length(poisson_manual_remove_terms_23) == 0) {
+  "포아송 단계별 변수선택 후 각 변수를 하나씩 제거해 보았을 때 AIC를 더 낮추는 변수가 없었으므로, 선택된 변수들을 모두 최종 모형에 유지하였다."
+} else {
+  paste0(
+    "포아송 단계별 변수선택 후 추가 검토에서 ",
+    paste(poisson_manual_remove_terms_23, collapse = ", "),
+    " 변수는 제거해도 AIC가 낮아지고 통계적 근거도 약하므로 최종 모형에서 제거하였다."
+  )
+}
+
+knitr::kable(
+  tibble(
+    stepwise_selected_variables = poisson_step_vars_text_23,
+    manually_removed_variables = if (length(poisson_manual_remove_terms_23) == 0) {
+      "없음"
+    } else {
+      paste(poisson_manual_remove_terms_23, collapse = ", ")
+    },
+    final_selected_variables = poisson_final_vars_text_23,
+    n_final_variables = length(poisson_final_vars_23),
+    final_AIC = AIC(final_pois_fit_23)
+  ) %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "포아송 회귀모형 최종 변수선택 결과"
+)
+
+knitr::kable(
+  poisson_final_coef_23 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "최종 포아송 회귀모형의 회귀계수"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 7. 음이항 회귀모형 적합
+# ------------------------------------------------------------
+# MASS::glm.nb()는 theta를 함께 추정한다.
+# 음이항 모형은 포아송 모형의 Var(W | X) = E(W | X) 가정을
+# Var(W | X) = mu + mu^2 / theta 로 완화한다.
+
+nb_full_try_23 <- safe_eval_23(
+  MASS::glm.nb(
+    full_count_formula_23,
+    data = teams_23,
+    control = glm.control(maxit = 100)
+  )
+)
+
+nb_step_try_23 <- list(
+  ok = FALSE,
+  value = NULL,
+  error = "전체 음이항 모형이 적합되지 않아 stepAIC를 실행하지 않음",
+  warnings = character()
+)
+
+if (nb_full_try_23$ok) {
+  nb_step_try_23 <- safe_eval_23(
+    MASS::stepAIC(
+      nb_full_try_23$value,
+      scope = list(
+        lower = null_count_formula_23,
+        upper = full_count_formula_23
+      ),
+      direction = "both",
+      trace = 0
+    )
+  )
+}
+
+nb_full_ok_23 <- nb_full_try_23$ok
+nb_step_ok_23 <- nb_step_try_23$ok
+
+nb_step_fit_23 <- if (nb_step_ok_23) nb_step_try_23$value else NULL
+nb_step_vars_23 <- character(0)
+nb_step_vars_text_23 <- "(음이항 stepwise 실패)"
+
+nb_drop_one_23 <- tibble(
+  term = character(),
+  ok = logical(),
+  AIC_if_removed = double(),
+  delta_AIC = double(),
+  message = character()
+)
+
+nb_manual_remove_terms_23 <- character(0)
+nb_final_fit_23 <- NULL
+nb_final_ok_23 <- FALSE
+nb_final_vars_23 <- character(0)
+nb_final_vars_text_23 <- "(음이항 최종 모형 적합 실패)"
+
+if (nb_step_ok_23) {
+  nb_step_vars_23 <- attr(terms(nb_step_fit_23), "term.labels") %>%
+    setdiff("offset(log(G_binom))")
+
+  nb_step_vars_text_23 <- fmt_terms_23(nb_step_vars_23)
+  current_nb_step_aic_23 <- AIC(nb_step_fit_23)
+
+  if (length(nb_step_vars_23) > 0) {
+    nb_drop_one_23 <- purrr::map_dfr(
+      nb_step_vars_23,
+      function(v) {
+        reduced_vars <- setdiff(nb_step_vars_23, v)
+
+        reduced_try <- safe_eval_23(
+          MASS::glm.nb(
+            make_count_formula_23(reduced_vars),
+            data = teams_23,
+            control = glm.control(maxit = 100)
+          )
+        )
+
+        tibble(
+          term = v,
+          ok = reduced_try$ok,
+          AIC_if_removed = if (reduced_try$ok) AIC(reduced_try$value) else NA_real_,
+          delta_AIC = if (reduced_try$ok) AIC(reduced_try$value) - current_nb_step_aic_23 else NA_real_,
+          message = safe_message_23(reduced_try)
+        )
+      }
+    ) %>%
+      arrange(delta_AIC)
+  }
+
+  nb_manual_remove_terms_23 <- nb_drop_one_23 %>%
+    filter(ok, delta_AIC <= 0) %>%
+    pull(term)
+
+  nb_final_vars_23 <- setdiff(nb_step_vars_23, nb_manual_remove_terms_23)
+
+  if (length(nb_manual_remove_terms_23) == 0) {
+    nb_final_fit_23 <- nb_step_fit_23
+    nb_final_ok_23 <- TRUE
+  } else {
+    nb_final_try_23 <- safe_eval_23(
+      MASS::glm.nb(
+        make_count_formula_23(nb_final_vars_23),
+        data = teams_23,
+        control = glm.control(maxit = 100)
+      )
+    )
+
+    if (nb_final_try_23$ok) {
+      nb_final_fit_23 <- nb_final_try_23$value
+      nb_final_ok_23 <- TRUE
+    } else {
+      nb_final_fit_23 <- nb_step_fit_23
+      nb_final_ok_23 <- TRUE
+      nb_final_vars_23 <- nb_step_vars_23
+      nb_manual_remove_terms_23 <- character(0)
+    }
+  }
+
+  nb_final_vars_text_23 <- fmt_terms_23(nb_final_vars_23)
+}
+
+nb_status_table_23 <- tibble(
+  stage = c("Full negative binomial fit", "AIC stepwise negative binomial"),
+  ok = c(nb_full_try_23$ok, nb_step_try_23$ok),
+  message = c(
+    safe_message_23(nb_full_try_23),
+    safe_message_23(nb_step_try_23)
+  )
+)
+
+knitr::kable(
+  nb_status_table_23,
+  caption = "음이항 회귀모형 적합 상태"
+)
+
+if (nb_step_ok_23) {
+  knitr::kable(
+    nb_step_fit_23$anova %>%
+      as_tibble(),
+    digits = 4,
+    caption = "음이항 회귀모형 stepAIC 변수선택 경로"
+  )
+
+  knitr::kable(
+    nb_drop_one_23 %>%
+      mutate(across(where(is.numeric), ~ round(.x, 4))),
+    caption = "음이항 단계별 변수선택 후 단일 변수 제거 검토"
+  )
+}
+```
+
+```{r}
+# ------------------------------------------------------------
+# 8. 음이항 최종 모형 결과 정리
+# ------------------------------------------------------------
+
+empty_coef_table_23 <- tibble(
+  term = character(),
+  estimate = double(),
+  std_error = double(),
+  z_value = double(),
+  p_value = double(),
+  conf_low = double(),
+  conf_high = double()
+)
+
+if (nb_final_ok_23) {
+  nb_final_coef_23 <- make_coef_table_23(nb_final_fit_23)
+
+  nb_theta_23 <- nb_final_fit_23$theta
+  nb_theta_se_23 <- nb_final_fit_23$SE.theta
+
+  nb_final_summary_23 <- tibble(
+    model = "Final negative binomial model",
+    final_selected_variables = nb_final_vars_text_23,
+    n_final_variables = length(nb_final_vars_23),
+    theta = nb_theta_23,
+    theta_se = nb_theta_se_23,
+    AIC = AIC(nb_final_fit_23),
+    residual_deviance = deviance(nb_final_fit_23),
+    df_residual = df.residual(nb_final_fit_23),
+    deviance_df_ratio = deviance(nb_final_fit_23) / df.residual(nb_final_fit_23)
+  )
+
+  knitr::kable(
+    nb_final_summary_23 %>%
+      mutate(across(where(is.numeric), ~ round(.x, 4))),
+    caption = "최종 음이항 회귀모형 요약"
+  )
+
+  knitr::kable(
+    nb_final_coef_23 %>%
+      mutate(across(where(is.numeric), ~ round(.x, 4))),
+    caption = "최종 음이항 회귀모형의 회귀계수"
+  )
+} else {
+  nb_final_coef_23 <- empty_coef_table_23
+  nb_theta_23 <- NA_real_
+  nb_theta_se_23 <- NA_real_
+
+  nb_final_summary_23 <- tibble(
+    model = "Final negative binomial model",
+    final_selected_variables = "(음이항 최종 모형 적합 실패)",
+    n_final_variables = NA_integer_,
+    theta = NA_real_,
+    theta_se = NA_real_,
+    AIC = NA_real_,
+    residual_deviance = NA_real_,
+    df_residual = NA_integer_,
+    deviance_df_ratio = NA_real_
+  )
+
+  knitr::kable(
+    nb_final_summary_23,
+    caption = "최종 음이항 회귀모형 요약"
+  )
+}
+
+nb_report_text_23 <- if (!nb_full_ok_23) {
+  paste0(
+    "음이항 전체 모형 적합 단계에서 오류가 발생하였다. 오류 메시지는 다음과 같다: ",
+    nb_full_try_23$error
+  )
+} else if (!nb_step_ok_23) {
+  paste0(
+    "음이항 전체 모형은 적합되었지만 stepAIC 변수선택 단계에서 오류가 발생하였다. 오류 메시지는 다음과 같다: ",
+    nb_step_try_23$error
+  )
+} else if (is.finite(nb_theta_23) && nb_theta_23 > 1e5) {
+  paste0(
+    "음이항 모형은 적합되었지만 theta 추정치가 매우 크다(theta = ",
+    round(nb_theta_23, 2),
+    "). 이는 음이항 모형이 실질적으로 포아송 모형에 가까워졌음을 의미한다."
+  )
+} else {
+  paste0(
+    "음이항 모형은 오류 없이 적합되었다. 최종 theta 추정치는 ",
+    round(nb_theta_23, 4),
+    "이고, 표준오차는 ",
+    round(nb_theta_se_23, 4),
+    "이다."
+  )
+}
+```
+
+```{r}
+# ------------------------------------------------------------
+# 9. 문제 2-2 로지스틱 모형, 포아송 모형, 음이항 모형 비교
+# ------------------------------------------------------------
+
+make_metrics_logit_23 <- function(fit, data, model_name) {
+  pred_wpct <- as.numeric(predict(fit, newdata = data, type = "response"))
+
+  tibble(
+    model = model_name,
+    likelihood_family = "binomial logistic",
+    response_used = "cbind(W, L)",
+    n_parameters = as.numeric(attr(logLik(fit), "df")),
+    AIC = AIC(fit),
+    residual_deviance = deviance(fit),
+    df_residual = df.residual(fit),
+    deviance_df_ratio = deviance(fit) / df.residual(fit),
+    RMSE_WPct = sqrt(mean((data$WPct - pred_wpct)^2)),
+    MAE_WPct = mean(abs(data$WPct - pred_wpct))
+  )
+}
+
+make_metrics_count_23 <- function(fit, data, model_name, family_label) {
+  pred_w <- as.numeric(predict(fit, newdata = data, type = "response"))
+  pred_wpct <- pred_w / data$G_binom
+
+  tibble(
+    model = model_name,
+    likelihood_family = family_label,
+    response_used = "W with offset(log(W + L))",
+    n_parameters = as.numeric(attr(logLik(fit), "df")),
+    AIC = AIC(fit),
+    residual_deviance = deviance(fit),
+    df_residual = df.residual(fit),
+    deviance_df_ratio = deviance(fit) / df.residual(fit),
+    RMSE_WPct = sqrt(mean((data$WPct - pred_wpct)^2)),
+    MAE_WPct = mean(abs(data$WPct - pred_wpct))
+  )
+}
+
+model_metrics_23 <- bind_rows(
+  make_metrics_logit_23(
+    final_logit_fit_23,
+    teams_23,
+    "Problem 2-2 final logistic model"
+  ),
+  make_metrics_count_23(
+    final_pois_fit_23,
+    teams_23,
+    "Final Poisson model"
+  ,
+    "poisson"
+  )
+)
+
+if (nb_final_ok_23) {
+  model_metrics_23 <- bind_rows(
+    model_metrics_23,
+    make_metrics_count_23(
+      nb_final_fit_23,
+      teams_23,
+      "Final negative binomial model",
+      "negative binomial"
+    )
+  )
+}
+
+knitr::kable(
+  model_metrics_23 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "문제 2-2 로지스틱 모형, 포아송 모형, 음이항 모형 비교"
+)
+
+poisson_overdispersion_23 <- tibble(
+  model = "Final Poisson model",
+  residual_deviance = deviance(final_pois_fit_23),
+  df_residual = df.residual(final_pois_fit_23),
+  deviance_df_ratio = residual_deviance / df_residual,
+  pearson_chisq = sum(residuals(final_pois_fit_23, type = "pearson")^2),
+  pearson_df_ratio = pearson_chisq / df_residual
+)
+
+knitr::kable(
+  poisson_overdispersion_23 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "최종 포아송 모형의 과산포 점검"
+)
+
+comparison_count_aic_text_23 <- if (nb_final_ok_23) {
+  aic_pois <- AIC(final_pois_fit_23)
+  aic_nb <- AIC(nb_final_fit_23)
+
+  if (aic_nb < aic_pois) {
+    paste0(
+      "포아송 모형과 음이항 모형은 둘 다 W를 count response로 사용하는 모형이므로 AIC를 직접 비교할 수 있다. ",
+      "음이항 모형의 AIC가 포아송 모형보다 ",
+      round(aic_pois - aic_nb, 2),
+      " 낮아 count likelihood 기준에서는 음이항 모형이 더 좋은 적합을 보인다."
+    )
+  } else if (aic_nb > aic_pois) {
+    paste0(
+      "포아송 모형과 음이항 모형은 둘 다 W를 count response로 사용하는 모형이므로 AIC를 직접 비교할 수 있다. ",
+      "음이항 모형의 AIC가 포아송 모형보다 ",
+      round(aic_nb - aic_pois, 2),
+      " 높아 count likelihood 기준에서는 포아송 모형이 더 간명하거나 적합도가 더 좋다."
+    )
+  } else {
+    "포아송 모형과 음이항 모형의 AIC가 거의 같으므로, 더 단순한 포아송 모형을 선호할 수 있다."
+  }
+} else {
+  "음이항 모형의 최종 적합이 실패했으므로 포아송 모형과 음이항 모형의 AIC 비교는 수행하지 않았다."
+}
+
+logit_vs_count_text_23 <- paste0(
+  "문제 2-2의 로지스틱 모형과 포아송/음이항 모형은 likelihood family가 다르므로 AIC의 절대값을 그대로 직접 비교하기보다는, ",
+  "관측 승률과 예측 승률의 RMSE 및 MAE, 그리고 모형의 해석 가능성을 함께 비교하는 것이 적절하다."
+)
+
+prediction_compare_23 <- teams_23 %>%
+  mutate(
+    fitted_logit_WPct = as.numeric(
+      predict(final_logit_fit_23, newdata = teams_23, type = "response")
+    ),
+    fitted_poisson_WPct = as.numeric(
+      predict(final_pois_fit_23, newdata = teams_23, type = "response")
+    ) / G_binom
+  ) %>%
+  select(yearID, teamID, WPct, fitted_logit_WPct, fitted_poisson_WPct)
+
+if (nb_final_ok_23) {
+  prediction_compare_23 <- prediction_compare_23 %>%
+    mutate(
+      fitted_nb_WPct = as.numeric(
+        predict(nb_final_fit_23, newdata = teams_23, type = "response")
+      ) / teams_23$G_binom
+    )
+}
+
+prediction_compare_long_23 <- prediction_compare_23 %>%
+  pivot_longer(
+    cols = starts_with("fitted_"),
+    names_to = "model",
+    values_to = "fitted_WPct"
+  ) %>%
+  mutate(
+    model = recode(
+      model,
+      fitted_logit_WPct = "Problem 2-2 logistic",
+      fitted_poisson_WPct = "Poisson",
+      fitted_nb_WPct = "Negative binomial"
+    )
+  )
+
+ggplot(prediction_compare_long_23, aes(x = WPct, y = fitted_WPct)) +
+  geom_point(alpha = 0.65) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~ model) +
+  coord_equal() +
+  labs(
+    x = "Observed WPct",
+    y = "Fitted WPct",
+    title = "Observed WPct vs fitted WPct: logistic, Poisson, negative binomial"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# ------------------------------------------------------------
+# 10. Python에서 사용할 객체 전달
+# ------------------------------------------------------------
+
+teams_23_py <- teams_23
+predictor_vars_23_py <- predictor_vars_23
+
+logit_final_vars_23_py <- logit_final_vars_23
+poisson_final_vars_23_py <- poisson_final_vars_23
+nb_final_vars_23_py <- nb_final_vars_23
+
+poisson_final_coef_23_py <- poisson_final_coef_23
+nb_final_coef_23_py <- nb_final_coef_23
+model_metrics_23_py <- model_metrics_23
+
+nb_final_ok_23_py <- nb_final_ok_23
+nb_theta_23_py <- nb_theta_23
+```
+
+## Python
+
+
+```{python}
+import numpy as np
+import pandas as pd
+from math import sqrt, erfc, lgamma, exp, log
+```
+
+```{python}
+#| results: asis
+
+# ------------------------------------------------------------
+# 1. R에서 정리한 분석용 데이터 가져오기
+# ------------------------------------------------------------
+
+teams = pd.DataFrame(r.teams_23_py).copy()
+
+predictor_vars = [str(v) for v in list(r.predictor_vars_23_py)]
+r_poisson_final_vars = [str(v) for v in list(r.poisson_final_vars_23_py)]
+r_nb_final_vars = [str(v) for v in list(r.nb_final_vars_23_py)]
+
+numeric_cols = [
+    "W", "L", "G_binom", "WPct", "RS", "RA", "log_rs_ra"
+] + predictor_vars
+
+for col in numeric_cols:
+    teams[col] = pd.to_numeric(teams[col], errors="coerce")
+
+
+def qmd_table(df, caption=None, digits=4):
+    """
+    Quarto HTML에서 pandas DataFrame을 실제 HTML 표로 출력하기 위한 함수.
+    일반 DataFrame repr보다 보고서에서 보기 좋게 렌더링된다.
+    """
+    out = df.copy()
+
+    numeric_columns = out.select_dtypes(include=[np.number]).columns
+    out[numeric_columns] = out[numeric_columns].round(digits)
+
+    if caption is not None:
+        print(f"<p><strong>{caption}</strong></p>")
+
+    print(
+        out.to_html(
+            index=False,
+            border=0,
+            escape=False,
+            classes="table table-sm table-striped"
+        )
+    )
+
+
+summary_py_23 = pd.DataFrame({
+    "n_team_seasons": [len(teams)],
+    "first_year": [int(teams["yearID"].min())],
+    "last_year": [int(teams["yearID"].max())],
+    "mean_W": [teams["W"].mean()],
+    "mean_WPct": [teams["WPct"].mean()],
+    "n_predictors": [len(predictor_vars)]
+})
+
+qmd_table(
+    summary_py_23,
+    caption="Python 분석 표본 요약",
+    digits=4
+)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 2. 포아송 회귀와 음이항 회귀에 사용할 함수
+# ------------------------------------------------------------
+
+def safe_exp(x):
+    return np.exp(np.clip(x, -35, 35))
+
+
+def normal_2sided_pvalue(z):
+    return erfc(abs(z) / sqrt(2))
+
+
+def make_coef_table(terms, beta, se):
+    beta = np.asarray(beta, dtype=float)
+    se = np.asarray(se, dtype=float)
+
+    z_value = beta / se
+    p_value = np.array([normal_2sided_pvalue(z) for z in z_value])
+
+    return pd.DataFrame({
+        "term": terms,
+        "estimate": beta,
+        "std_error": se,
+        "z_value": z_value,
+        "p_value": p_value,
+        "conf_low": beta - 1.96 * se,
+        "conf_high": beta + 1.96 * se
+    })
+
+
+def poisson_loglik(y, mu):
+    eps = 1e-12
+    mu = np.clip(mu, eps, None)
+
+    return float(
+        np.sum(
+            y * np.log(mu) -
+            mu -
+            np.array([lgamma(v + 1) for v in y])
+        )
+    )
+
+
+def poisson_deviance(y, mu):
+    eps = 1e-12
+    mu = np.clip(mu, eps, None)
+
+    term = np.zeros_like(y, dtype=float)
+    positive = y > 0
+    term[positive] = y[positive] * np.log(y[positive] / mu[positive])
+
+    return float(2 * np.sum(term - (y - mu)))
+
+
+def fit_poisson_irls(X, y, offset=None, max_iter=200, tol=1e-10):
+    """
+    Poisson regression with log link by IRLS.
+    X에는 절편열이 포함되어 있어야 한다.
+    """
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if offset is None:
+        offset = np.zeros_like(y, dtype=float)
+    else:
+        offset = np.asarray(offset, dtype=float)
+
+    n_obs, n_params = X.shape
+    beta = np.zeros(n_params)
+
+    for iteration in range(max_iter):
+        eta = offset + X @ beta
+        mu = safe_exp(eta)
+
+        weights = np.clip(mu, 1e-10, None)
+        z = eta + (y - mu) / weights
+
+        XtW = X.T * weights
+        hessian = XtW @ X
+        rhs = XtW @ (z - offset)
+
+        try:
+            beta_new = np.linalg.solve(hessian, rhs)
+        except np.linalg.LinAlgError:
+            beta_new = np.linalg.pinv(hessian) @ rhs
+
+        if np.max(np.abs(beta_new - beta)) < tol:
+            beta = beta_new
+            converged = True
+            break
+
+        beta = beta_new
+    else:
+        converged = False
+
+    eta = offset + X @ beta
+    mu = safe_exp(eta)
+
+    info = (X.T * mu) @ X
+    cov = np.linalg.pinv(info)
+    se = np.sqrt(np.diag(cov))
+
+    loglik = poisson_loglik(y, mu)
+    aic = -2 * loglik + 2 * n_params
+
+    deviance = poisson_deviance(y, mu)
+    df_residual = n_obs - n_params
+
+    return {
+        "beta": beta,
+        "se": se,
+        "cov": cov,
+        "eta": eta,
+        "mu": mu,
+        "loglik": loglik,
+        "aic": aic,
+        "deviance": deviance,
+        "df_residual": df_residual,
+        "converged": converged,
+        "n_iter": iteration + 1,
+        "n_params": n_params
+    }
+```
+
+```{python}
+# ------------------------------------------------------------
+# 3. Python에서 포아송 AIC stepwise 변수선택
+# ------------------------------------------------------------
+
+y_wins = teams["W"].to_numpy(dtype=float)
+g_games = teams["G_binom"].to_numpy(dtype=float)
+offset_log_games = np.log(g_games)
+observed_wpct = teams["WPct"].to_numpy(dtype=float)
+
+# 수치적 안정성을 위해 설명변수는 표준화한다.
+# 절편과 offset이 있으므로 표준화 전후의 선형공간은 같다.
+X_raw = teams[predictor_vars].copy()
+means = X_raw.mean(axis=0)
+stds = X_raw.std(axis=0, ddof=0)
+stds = stds.mask(stds == 0, 1.0)
+X_std = (X_raw - means) / stds
+
+_fit_cache_pois = {}
+
+
+def build_design(var_list):
+    cols = [np.ones(len(teams))]
+
+    for var in var_list:
+        cols.append(X_std[var].to_numpy(dtype=float))
+
+    return np.column_stack(cols)
+
+
+def fit_poisson_vars(var_list):
+    key = tuple(var_list)
+
+    if key not in _fit_cache_pois:
+        X = build_design(list(var_list))
+        _fit_cache_pois[key] = fit_poisson_irls(
+            X=X,
+            y=y_wins,
+            offset=offset_log_games
+        )
+
+    return _fit_cache_pois[key]
+
+
+def stepwise_aic_poisson(all_vars, start_vars=None, tol=1e-7, max_steps=100):
+    all_vars = list(all_vars)
+
+    if start_vars is None:
+        current_vars = list(all_vars)
+    else:
+        current_vars = list(start_vars)
+
+    current_fit = fit_poisson_vars(current_vars)
+
+    path = [{
+        "step": 0,
+        "action": "start",
+        "variable": "",
+        "n_variables": len(current_vars),
+        "AIC": current_fit["aic"],
+        "selected_variables": ", ".join(current_vars)
+    }]
+
+    for step in range(1, max_steps + 1):
+        candidates = []
+
+        for var in current_vars:
+            new_vars = [v for v in current_vars if v != var]
+            candidates.append(
+                ("drop", var, new_vars, fit_poisson_vars(new_vars))
+            )
+
+        for var in all_vars:
+            if var not in current_vars:
+                new_vars = current_vars + [var]
+                candidates.append(
+                    ("add", var, new_vars, fit_poisson_vars(new_vars))
+                )
+
+        if len(candidates) == 0:
+            break
+
+        best_action, best_var, best_vars, best_fit = min(
+            candidates,
+            key=lambda item: item[3]["aic"]
+        )
+
+        if best_fit["aic"] < current_fit["aic"] - tol:
+            current_vars = best_vars
+            current_fit = best_fit
+
+            path.append({
+                "step": step,
+                "action": best_action,
+                "variable": best_var,
+                "n_variables": len(current_vars),
+                "AIC": current_fit["aic"],
+                "selected_variables": ", ".join(current_vars)
+            })
+        else:
+            break
+
+    return current_vars, current_fit, pd.DataFrame(path)
+
+
+py_poisson_step_vars, py_poisson_step_fit, py_poisson_step_path = stepwise_aic_poisson(
+    predictor_vars,
+    start_vars=predictor_vars
+)
+```
+
+```{python}
+#| results: asis
+
+qmd_table(
+    py_poisson_step_path[
+        ["step", "action", "variable", "n_variables", "AIC"]
+    ],
+    caption="Python 포아송 회귀모형 AIC stepwise 변수선택 경로",
+    digits=4
+)
+```
+
+```{python}
+#| results: asis
+
+# ------------------------------------------------------------
+# 4. R의 포아송 최종 선택 변수와 Python stepwise 결과 비교
+# ------------------------------------------------------------
+
+selection_compare_poisson_py_23 = pd.DataFrame({
+    "variable": predictor_vars
+})
+
+selection_compare_poisson_py_23["selected_by_R_final_poisson"] = (
+    selection_compare_poisson_py_23["variable"].isin(r_poisson_final_vars)
+)
+
+selection_compare_poisson_py_23["selected_by_Python_stepwise_poisson"] = (
+    selection_compare_poisson_py_23["variable"].isin(py_poisson_step_vars)
+)
+
+selection_summary_poisson_py_23 = pd.DataFrame({
+    "item": [
+        "R final Poisson variables",
+        "Python stepwise Poisson variables"
+    ],
+    "variables": [
+        ", ".join(r_poisson_final_vars)
+        if len(r_poisson_final_vars) > 0
+        else "(intercept only)",
+        ", ".join(py_poisson_step_vars)
+        if len(py_poisson_step_vars) > 0
+        else "(intercept only)"
+    ],
+    "n_variables": [
+        len(r_poisson_final_vars),
+        len(py_poisson_step_vars)
+    ]
+})
+
+qmd_table(
+    selection_summary_poisson_py_23,
+    caption="R과 Python의 포아송 변수선택 결과 요약",
+    digits=4
+)
+
+qmd_table(
+    selection_compare_poisson_py_23,
+    caption="R과 Python의 포아송 선택 변수 비교",
+    digits=4
+)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 5. R에서 선택한 포아송 최종 변수로 Python에서도 같은 모형 재적합
+# ------------------------------------------------------------
+
+poisson_final_fit_py = fit_poisson_vars(r_poisson_final_vars)
+
+
+def transform_standardized_to_raw(fit, var_list):
+    """
+    표준화 변수로 적합한 회귀계수를 원래 변수 척도로 변환한다.
+    """
+    var_list = list(var_list)
+    p = len(var_list) + 1
+
+    beta_std = fit["beta"]
+    cov_std = fit["cov"]
+
+    T = np.zeros((p, p))
+    T[0, 0] = 1.0
+
+    for j, var in enumerate(var_list, start=1):
+        mean_j = float(means[var])
+        sd_j = float(stds[var])
+
+        T[0, j] = -mean_j / sd_j
+        T[j, j] = 1.0 / sd_j
+
+    beta_raw = T @ beta_std
+    cov_raw = T @ cov_std @ T.T
+    se_raw = np.sqrt(np.diag(cov_raw))
+
+    return beta_raw, se_raw, cov_raw
+
+
+beta_poisson_raw_py, se_poisson_raw_py, cov_poisson_raw_py = (
+    transform_standardized_to_raw(
+        poisson_final_fit_py,
+        r_poisson_final_vars
+    )
+)
+
+coef_poisson_py_23 = make_coef_table(
+    terms=["(Intercept)"] + r_poisson_final_vars,
+    beta=beta_poisson_raw_py,
+    se=se_poisson_raw_py
+)
+```
+
+```{python}
+#| results: asis
+
+qmd_table(
+    coef_poisson_py_23,
+    caption="Python 최종 포아송 회귀모형의 회귀계수",
+    digits=6
+)
+```
+
+```{python}
+#| results: asis
+
+# ------------------------------------------------------------
+# 6. R과 Python의 포아송 최종 모형 계수 비교
+# ------------------------------------------------------------
+
+coef_poisson_r_23 = pd.DataFrame(r.poisson_final_coef_23_py).copy()
+
+coef_compare_poisson_language_23 = (
+    coef_poisson_py_23[["term", "estimate", "std_error"]]
+    .rename(columns={
+        "estimate": "estimate_py",
+        "std_error": "std_error_py"
+    })
+    .merge(
+        coef_poisson_r_23[["term", "estimate", "std_error"]],
+        on="term",
+        how="inner"
+    )
+    .rename(columns={
+        "estimate": "estimate_r",
+        "std_error": "std_error_r"
+    })
+)
+
+coef_compare_poisson_language_23["abs_estimate_diff"] = np.abs(
+    coef_compare_poisson_language_23["estimate_py"] -
+    coef_compare_poisson_language_23["estimate_r"]
+)
+
+coef_compare_poisson_language_23["abs_se_diff"] = np.abs(
+    coef_compare_poisson_language_23["std_error_py"] -
+    coef_compare_poisson_language_23["std_error_r"]
+)
+
+qmd_table(
+    coef_compare_poisson_language_23,
+    caption="R과 Python의 최종 포아송 회귀계수 비교",
+    digits=8
+)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 7. Python에서 음이항 회귀모형 적합
+# ------------------------------------------------------------
+# R에서 음이항 stepwise가 성공했다면 R의 최종 음이항 변수집합을 사용한다.
+# R에서 음이항 stepwise가 실패했다면, Python에서는 포아송 최종 변수집합을 사용한
+# fallback 음이항 모형을 적합하여 음이항 가능성을 확인한다.
+
+def nb_loglik(y, mu, theta):
+    eps = 1e-12
+    mu = np.clip(mu, eps, None)
+    theta = max(float(theta), eps)
+
+    out = 0.0
+
+    for yi, mui in zip(y, mu):
+        out += (
+            lgamma(yi + theta) -
+            lgamma(theta) -
+            lgamma(yi + 1) +
+            theta * log(theta / (theta + mui)) +
+            yi * log(mui / (theta + mui))
+        )
+
+    return float(out)
+
+
+def fit_nb_fixed_theta_irls(X, y, offset, theta, max_iter=200, tol=1e-10):
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    offset = np.asarray(offset, dtype=float)
+    theta = float(theta)
+
+    n_obs, n_params = X.shape
+    beta = np.zeros(n_params)
+
+    for iteration in range(max_iter):
+        eta = offset + X @ beta
+        mu = safe_exp(eta)
+
+        variance = mu + (mu ** 2) / theta
+        weights = np.clip((mu ** 2) / variance, 1e-10, None)
+        z = eta + (y - mu) / np.clip(mu, 1e-10, None)
+
+        XtW = X.T * weights
+        hessian = XtW @ X
+        rhs = XtW @ (z - offset)
+
+        try:
+            beta_new = np.linalg.solve(hessian, rhs)
+        except np.linalg.LinAlgError:
+            beta_new = np.linalg.pinv(hessian) @ rhs
+
+        if np.max(np.abs(beta_new - beta)) < tol:
+            beta = beta_new
+            converged = True
+            break
+
+        beta = beta_new
+    else:
+        converged = False
+
+    eta = offset + X @ beta
+    mu = safe_exp(eta)
+
+    variance = mu + (mu ** 2) / theta
+    weights = np.clip((mu ** 2) / variance, 1e-10, None)
+
+    info = (X.T * weights) @ X
+    cov = np.linalg.pinv(info)
+    se = np.sqrt(np.diag(cov))
+
+    ll = nb_loglik(y, mu, theta)
+
+    return {
+        "beta": beta,
+        "se": se,
+        "cov": cov,
+        "eta": eta,
+        "mu": mu,
+        "theta": theta,
+        "loglik": ll,
+        "converged": converged,
+        "n_iter": iteration + 1,
+        "n_params_beta": n_params
+    }
+
+
+def golden_section_minimize(func, lower, upper, tol=1e-6, max_iter=120):
+    invphi = (sqrt(5) - 1) / 2
+
+    a = lower
+    b = upper
+    h = b - a
+
+    c = b - invphi * h
+    d = a + invphi * h
+    fc = func(c)
+    fd = func(d)
+
+    for _ in range(max_iter):
+        if abs(b - a) < tol:
+            break
+
+        if fc < fd:
+            b = d
+            d = c
+            fd = fc
+            h = b - a
+            c = b - invphi * h
+            fc = func(c)
+        else:
+            a = c
+            c = d
+            fc = fd
+            h = b - a
+            d = a + invphi * h
+            fd = func(d)
+
+    return (a + b) / 2
+
+
+def fit_nb_glm(X, y, offset):
+    """
+    NB2 regression by profiling theta.
+    Var(Y | X) = mu + mu^2 / theta.
+    AIC 계산에서는 beta 모수와 theta 모수를 모두 센다.
+    """
+    def objective(log_theta):
+        theta = exp(log_theta)
+        fit = fit_nb_fixed_theta_irls(X, y, offset, theta)
+        return -fit["loglik"]
+
+    log_theta_hat = golden_section_minimize(
+        objective,
+        lower=log(0.01),
+        upper=log(1e6)
+    )
+
+    theta_hat = exp(log_theta_hat)
+    fit = fit_nb_fixed_theta_irls(X, y, offset, theta_hat)
+
+    n_params = fit["n_params_beta"] + 1
+    fit["aic"] = -2 * fit["loglik"] + 2 * n_params
+    fit["n_params"] = n_params
+
+    return fit
+
+
+nb_final_ok_from_r = bool(r.nb_final_ok_23_py)
+
+if nb_final_ok_from_r and len(r_nb_final_vars) > 0:
+    nb_vars_for_python = r_nb_final_vars
+    nb_variable_source = "R final negative binomial variables"
+else:
+    nb_vars_for_python = r_poisson_final_vars
+    nb_variable_source = "Fallback: R final Poisson variables"
+
+try:
+    X_nb_final = build_design(nb_vars_for_python)
+
+    nb_final_fit_py = fit_nb_glm(
+        X=X_nb_final,
+        y=y_wins,
+        offset=offset_log_games
+    )
+
+    beta_nb_raw_py, se_nb_raw_py, cov_nb_raw_py = (
+        transform_standardized_to_raw(
+            nb_final_fit_py,
+            nb_vars_for_python
+        )
+    )
+
+    coef_nb_py_23 = make_coef_table(
+        terms=["(Intercept)"] + nb_vars_for_python,
+        beta=beta_nb_raw_py,
+        se=se_nb_raw_py
+    )
+
+    nb_fit_status_py_23 = "success"
+    nb_error_message_py_23 = ""
+
+except Exception as e:
+    nb_final_fit_py = None
+    coef_nb_py_23 = pd.DataFrame()
+    nb_fit_status_py_23 = "failed"
+    nb_error_message_py_23 = str(e)
+```
+
+```{python}
+#| results: asis
+
+nb_status_py_23 = pd.DataFrame({
+    "item": [
+        "R negative binomial final fit available",
+        "Python negative binomial variable source",
+        "Python negative binomial fit status",
+        "Python error message",
+    ],
+    "value": [
+        str(nb_final_ok_from_r),
+        nb_variable_source,
+        nb_fit_status_py_23,
+        nb_error_message_py_23 if nb_error_message_py_23 else "(none)"
+    ]
+})
+
+qmd_table(
+    nb_status_py_23,
+    caption="Python 음이항 회귀모형 적합 상태",
+    digits=4
+)
+
+if nb_final_fit_py is not None:
+    nb_summary_py_23 = pd.DataFrame({
+        "theta": [nb_final_fit_py["theta"]],
+        "AIC": [nb_final_fit_py["aic"]],
+        "n_parameters": [nb_final_fit_py["n_params"]],
+        "converged": [nb_final_fit_py["converged"]],
+        "n_iter": [nb_final_fit_py["n_iter"]],
+        "variables": [
+            ", ".join(nb_vars_for_python)
+            if len(nb_vars_for_python) > 0
+            else "(intercept only)"
+        ]
+    })
+
+    qmd_table(
+        nb_summary_py_23,
+        caption="Python 음이항 회귀모형 요약",
+        digits=4
+    )
+
+    qmd_table(
+        coef_nb_py_23,
+        caption="Python 음이항 회귀모형의 회귀계수",
+        digits=6
+    )
+else:
+    qmd_table(
+        pd.DataFrame({
+            "message": [
+                "Python에서도 음이항 모형 적합에 실패하였다. 위의 오류 메시지를 확인한다."
+            ]
+        }),
+        caption="Python 음이항 회귀모형 결과",
+        digits=4
+    )
+```
+
+```{python}
+#| results: asis
+
+# ------------------------------------------------------------
+# 8. Python 기준 예측 성능 비교
+# ------------------------------------------------------------
+
+def metrics_from_count_fit(fit, model_name, family_label):
+    fitted_wpct = fit["mu"] / g_games
+
+    return {
+        "model": model_name,
+        "family": family_label,
+        "AIC": fit["aic"],
+        "RMSE_WPct": np.sqrt(np.mean((observed_wpct - fitted_wpct) ** 2)),
+        "MAE_WPct": np.mean(np.abs(observed_wpct - fitted_wpct)),
+        "n_parameters": fit["n_params"],
+        "converged": fit["converged"],
+        "n_iter": fit["n_iter"]
+    }
+
+
+metrics_py_rows = [
+    metrics_from_count_fit(
+        poisson_final_fit_py,
+        "Final Poisson model refit in Python",
+        "Poisson"
+    )
+]
+
+if nb_final_fit_py is not None:
+    metrics_py_rows.append(
+        metrics_from_count_fit(
+            nb_final_fit_py,
+            "Negative binomial model refit in Python",
+            "Negative binomial"
+        )
+    )
+
+model_metrics_py_23 = pd.DataFrame(metrics_py_rows)
+
+qmd_table(
+    model_metrics_py_23,
+    caption="Python 기준 포아송 모형과 음이항 모형의 예측 성능 비교",
+    digits=4
+)
+```
+
+```{python}
+#| results: asis
+
+# ------------------------------------------------------------
+# 9. R에서 만든 문제 2-2 로지스틱 모형, 포아송 모형, 음이항 모형 비교표 확인
+# ------------------------------------------------------------
+# 로지스틱 모형은 likelihood family가 다르므로 AIC를 그대로 직접 비교하기보다는
+# RMSE_WPct와 MAE_WPct도 함께 확인한다.
+
+model_metrics_r_23 = pd.DataFrame(r.model_metrics_23_py).copy()
+
+qmd_table(
+    model_metrics_r_23,
+    caption="R 기준 문제 2-2 로지스틱 모형, 포아송 모형, 음이항 모형 비교",
+    digits=4
+)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 10. Python 그래프: 관측 승률과 예측 승률 비교
+# ------------------------------------------------------------
+
+import matplotlib.pyplot as plt
+
+prediction_compare_py_23 = pd.DataFrame({
+    "WPct": observed_wpct,
+    "fitted_WPct": poisson_final_fit_py["mu"] / g_games,
+    "model": "Poisson"
+})
+
+if nb_final_fit_py is not None:
+    prediction_compare_py_23 = pd.concat(
+        [
+            prediction_compare_py_23,
+            pd.DataFrame({
+                "WPct": observed_wpct,
+                "fitted_WPct": nb_final_fit_py["mu"] / g_games,
+                "model": "Negative binomial"
+            })
+        ],
+        ignore_index=True
+    )
+
+model_order_23 = list(prediction_compare_py_23["model"].unique())
+
+x_min = prediction_compare_py_23["WPct"].min()
+x_max = prediction_compare_py_23["WPct"].max()
+y_min = prediction_compare_py_23["fitted_WPct"].min()
+y_max = prediction_compare_py_23["fitted_WPct"].max()
+
+plot_min = min(x_min, y_min)
+plot_max = max(x_max, y_max)
+
+fig, axes = plt.subplots(
+    1,
+    len(model_order_23),
+    figsize=(5 * len(model_order_23), 4),
+    sharex=True,
+    sharey=True
+)
+
+if len(model_order_23) == 1:
+    axes = [axes]
+
+for ax, model_name in zip(axes, model_order_23):
+    plot_data = prediction_compare_py_23[
+        prediction_compare_py_23["model"] == model_name
+    ]
+
+    ax.scatter(
+        plot_data["WPct"],
+        plot_data["fitted_WPct"],
+        alpha=0.65
+    )
+
+    ax.plot(
+        [plot_min, plot_max],
+        [plot_min, plot_max],
+        linestyle="--"
+    )
+
+    ax.set_title(model_name)
+    ax.set_xlabel("Observed WPct")
+    ax.set_ylabel("Fitted WPct")
+    ax.grid(True, alpha=0.3)
+
+fig.suptitle("Observed vs fitted WPct: count models")
+fig.tight_layout()
+
+plt.show()
+```
+
+
+:::
+
+### 데이터 랭글링 절차 설명
+
+먼저 문제 2-2와 동일하게 Lahman 패키지의 `Teams` 자료에서 2010년부터 2025년까지의 팀-시즌 자료를 사용하되, 코로나 단축 시즌인 2020년은 제외하였다. 
+사용 중인 Lahman 패키지 버전에 따라 2025년 자료가 아직 포함되어 있지 않을 수 있으므로, 실제로 분석에 들어간 연도와 누락된 연도를 표로 확인하였다. 
+분석에 사용된 팀-시즌 수는 `r nrow(teams_23)`개이고, 사용된 연도는 `r paste(sort(unique(teams_23$yearID)), collapse = ", ")`이다.
+
+반응변수는 승리 횟수 `W`이다. 
+문제 2-2의 로지스틱 회귀모형은 `W`를 성공 횟수, `L`을 실패 횟수로 보는 grouped binomial 모형이었지만, 여기서는 `W` 자체를 count response로 보았다. 
+다만 각 팀의 경기 수가 다를 수 있으므로 포아송 회귀와 음이항 회귀 모두 `offset(log(W + L))`을 포함하였다. 
+따라서 모형은 총 경기 수를 보정한 뒤 승리율의 차이를 설명하는 구조를 가진다.
+
+### 포아송 회귀모형 결과
+
+포아송 회귀모형에서는 먼저 문제 2-2와 같은 모든 설명변수를 포함한 전체 모형을 적합하였다. 
+그다음 AIC 기준의 양방향 단계별 변수선택을 수행하였다. 
+단계별 변수선택 후에는 남은 변수들을 하나씩 제거했을 때 AIC가 더 낮아지는지 다시 확인하였다.
+
+포아송 단계별 변수선택 후 선택된 변수는 다음과 같다.
+
+`r poisson_step_vars_text_23`
+
+추가 검토 결과는 다음과 같다.
+
+`r poisson_final_decision_text_23`
+
+따라서 최종 포아송 회귀모형에 남은 변수는 다음과 같다.
+
+`r poisson_final_vars_text_23`
+
+포아송 회귀계수는 로그 평균 승리 횟수의 변화량으로 해석된다. 
+단, 이 모형에는 `offset(log(W + L))`이 포함되어 있으므로, 실제로는 경기 수를 보정한 승리율의 로그 변화량에 대한 효과로 해석할 수 있다. 
+계수가 양수이면 다른 변수들이 고정되어 있을 때 해당 변수가 증가할수록 기대 승리 횟수 또는 기대 승률이 증가하는 방향으로 관련되어 있음을 의미한다. 
+계수가 음수이면 반대 방향의 관련성을 의미한다.
+
+포아송 모형에서는 평균과 분산이 같다는 가정을 한다. 
+최종 포아송 모형의 residual deviance / df 값은 `r round(poisson_overdispersion_23$deviance_df_ratio, 4)`이고, Pearson chi-square / df 값은 `r round(poisson_overdispersion_23$pearson_df_ratio, 4)`이다. 
+이 값들이 1보다 많이 크면 과산포가 있다는 신호이고, 이 경우 음이항 모형이 포아송 모형보다 더 적절할 수 있다. 
+반대로 1에 가깝다면 포아송의 평균-분산 가정이 크게 어긋나지 않는다고 볼 수 있다.
+
+### 음이항 회귀모형 결과
+
+음이항 회귀모형은 포아송 회귀모형의 평균-분산 동일성 가정을 완화한다. 
+여기서 사용한 음이항 모형은 다음과 같은 분산 구조를 가진다.
+
+$begin:math:display$
+Var\(W\_i \\mid X\_i\)
+\=
+\\mu\_i \+ \\frac\{\\mu\_i\^2\}\{\\theta\}\.
+$end:math:display$
+
+$begin:math:text$\\theta$end:math:text$가 매우 크면 $begin:math:text$\\mu\_i\^2 \/ \\theta$end:math:text$ 항이 거의 0이 되므로, 음이항 모형은 포아송 모형에 가까워진다. 
+반대로 $begin:math:text$\\theta$end:math:text$가 작을수록 포아송 모형보다 더 큰 과산포를 허용한다.
+
+음이항 모형 적합 결과는 다음과 같이 요약된다.
+
+`r nb_report_text_23`
+
+음이항 최종 모형에 남은 변수는 다음과 같다.
+
+`r nb_final_vars_text_23`
+
+음이항 모형 적합 시 오류가 발생했다면, 위의 적합 상태 표에 오류 메시지를 그대로 출력하였다. 
+오류가 발생하는 일반적인 이유는 설명변수 사이의 강한 다중공선성, 과도하게 복잡한 모형, theta 추정이 경계값으로 가는 경우, 또는 자료가 음이항 모형이 가정하는 과산포 구조를 충분히 지지하지 않는 경우이다. 
+특히 승리 횟수 `W`는 실제로 `W + L`번의 경기 중 얻은 승수이므로 위쪽이 경기 수로 제한되어 있다. 
+반면 포아송과 음이항 분포는 이론적으로 위쪽 경계가 없는 count distribution이다. 
+따라서 야구 팀의 승리 횟수에는 grouped binomial logistic regression이 구조적으로 더 자연스러운 모형일 수 있다.
+
+### 문제 2-2 로지스틱 모형과의 비교
+
+문제 2-2의 최종 로지스틱 모형은 다음 변수들을 선택하였다.
+
+`r logit_final_vars_text_23`
+
+포아송 최종 모형은 다음 변수들을 선택하였다.
+
+`r poisson_final_vars_text_23`
+
+음이항 최종 모형은 다음 변수들을 선택하였다.
+
+`r nb_final_vars_text_23`
+
+문제 2-2의 로지스틱 모형은 `W`와 `L`을 함께 사용하여 승률을 직접 모형화한다. 
+반면 포아송 모형과 음이항 모형은 `W`를 count response로 보고, 경기 수를 offset으로 보정한다. 
+따라서 세 모형은 모두 승리 또는 승률을 설명하지만 likelihood family가 다르다.
+
+`r logit_vs_count_text_23`
+
+포아송 모형과 음이항 모형 사이의 비교는 다음과 같다.
+
+`r comparison_count_aic_text_23`
+
+예측 성능 측면에서는 표의 `RMSE_WPct`와 `MAE_WPct`를 비교할 수 있다. 
+이 값들은 관측 승률과 모형에서 예측한 승률 사이의 차이를 나타내며, 값이 작을수록 표본 내 예측 성능이 좋다. 
+포아송과 음이항 모형의 예측 승률은 예측 승리 횟수를 경기 수 `W + L`로 나누어 계산하였다.
+
+### R과 Python 결과 비교
+
+R에서는 `glm(..., family = poisson)`으로 포아송 회귀모형을 적합하고, `step()`으로 AIC 기준 단계별 변수선택을 수행하였다. 
+음이항 회귀모형은 `MASS::glm.nb()`와 `MASS::stepAIC()`를 사용하여 적합하였다. 
+Python에서는 같은 데이터를 사용하여 포아송 회귀의 IRLS 알고리즘과 AIC 기준 stepwise search를 직접 구현하였다. 
+음이항 모형은 R에서 최종 선택된 변수집합을 기준으로 Python에서 NB2 likelihood를 직접 최대화하여 재적합하였다.
+
+R과 Python의 포아송 회귀계수 비교표에서 `abs_estimate_diff`와 `abs_se_diff`가 매우 작으면 두 언어의 결과가 사실상 같다고 볼 수 있다. 
+작은 차이가 있다면 이는 통계적 모형의 차이가 아니라 수치 최적화 알고리즘, 수렴 기준, 행렬 역행렬 계산 방식, 부동소수점 연산 차이에서 비롯된 것이다. 
+음이항 모형의 경우에는 theta를 추정하는 방식이 R의 `glm.nb()`와 Python의 직접 구현 사이에서 다르므로, 포아송 모형보다 차이가 조금 더 클 수 있다.
+
+### Python 결과 보강 설명
+
+Python 탭에서는 포아송 회귀모형의 IRLS 알고리즘과 AIC 기준 stepwise 변수선택을 직접 구현하였다. 
+표준화한 설명변수를 사용해 수치적 안정성을 높였고, 최종 회귀계수는 다시 원래 변수 척도로 변환하였다. 
+그 결과 Python의 포아송 stepwise 변수선택 결과는 R의 최종 포아송 변수선택 결과와 동일하게 나타났다. 
+또한 같은 변수집합을 사용하여 R과 Python의 포아송 회귀계수를 비교하면 추정치 차이는 거의 0에 가까웠다.
+
+음이항 회귀모형의 경우, R에서 자동 stepwise 또는 최종 모형 적합이 실패할 수 있다. 
+이 경우 Python 탭에서는 그 사실을 표로 보고하고, 추가적으로 포아송 최종 변수집합을 사용한 fallback 음이항 모형을 적합하였다. 
+이 fallback 모형은 R의 stepwise 음이항 최종 모형과 동일한 절차는 아니지만, 음이항 likelihood를 사용했을 때의 적합 가능성과 $begin:math:text$\\theta$end:math:text$ 추정치를 확인하기 위한 보조 분석이다. 
+$begin:math:text$\\theta$end:math:text$가 매우 크게 추정되면 음이항 모형은 사실상 포아송 모형에 가까워진다. 
+따라서 음이항 모형이 오류를 내거나 $begin:math:text$\\theta$end:math:text$가 매우 큰 값으로 추정된다면, 이 자료에서는 포아송 모형에 비해 음이항 모형이 뚜렷한 추가 이점을 주지 않는다고 해석할 수 있다.
+
+마지막으로 Python 탭에도 관측 승률과 예측 승률의 산점도를 추가하였다. 
+이를 통해 포아송 모형과 음이항 모형이 실제 승률을 얼마나 잘 예측하는지 시각적으로 확인할 수 있다.
 
 ## 문제 2-4
 
@@ -126,6 +4820,1001 @@ $$
 
 
 ### 답안
+
+이 문제의 핵심은 Bill James 형태의 승률 모형에서 $begin:math:text$k$end:math:text$ 계수가 스테로이드 시대와 최근 시대 사이에 달라졌는지를 검정하는 것이다. 
+문제에서 제시한 모형은 다음과 같다.
+
+$begin:math:display$
+WPct\(i\,t\)
+\=
+\\frac\{1\}\{1 \+ \(RA\_\{i\,t\}\/RS\_\{i\,t\}\)\^\{k \+ gI\(1994 \\le t \\le 2005\)\}\}\.
+$end:math:display$
+
+여기서 $begin:math:text$I\(1994 \\le t \\le 2005\)$end:math:text$는 스테로이드 시대이면 1, 그렇지 않으면 0인 지시변수이다. 
+위 식을 로짓 변환하면 다음과 같다.
+
+$begin:math:display$
+\\text\{logit\}\(WPct\(i\,t\)\)
+\=
+\\\{k \+ gI\(1994 \\le t \\le 2005\)\\\}
+\\log\(RS\_\{i\,t\}\/RA\_\{i\,t\}\)\.
+$end:math:display$
+
+따라서 $begin:math:text$W\_\{i\,t\}$end:math:text$를 성공 횟수, $begin:math:text$L\_\{i\,t\}$end:math:text$를 실패 횟수로 보는 grouped binomial logistic regression을 다음과 같이 적합하면 된다.
+
+$begin:math:display$
+W\_\{i\,t\} \\sim \\text\{Binomial\}\(W\_\{i\,t\}\+L\_\{i\,t\}\, p\_\{i\,t\}\)\,
+$end:math:display$
+
+$begin:math:display$
+\\text\{logit\}\(p\_\{i\,t\}\)
+\=
+k\\log\(RS\_\{i\,t\}\/RA\_\{i\,t\}\)
+\+
+gI\(1994 \\le t \\le 2005\)\\log\(RS\_\{i\,t\}\/RA\_\{i\,t\}\)\.
+$end:math:display$
+
+이 모형에는 절편을 넣지 않는다. 
+왜냐하면 원래 Bill James 형태의 모형을 로짓 변환하면 절편항이 생기지 않기 때문이다. 
+이때 $begin:math:text$k$end:math:text$는 최근 시대, 즉 2010년부터 2025년 사이의 $begin:math:text$k$end:math:text$ 계수이고, $begin:math:text$k\+g$end:math:text$는 스테로이드 시대인 1994년부터 2005년 사이의 $begin:math:text$k$end:math:text$ 계수이다. 
+따라서 $begin:math:text$g\=0$end:math:text$이라는 귀무가설은 두 시대의 $begin:math:text$k$end:math:text$ 계수가 같다는 의미이다.
+
+::: {.panel-tabset}
+
+## R
+
+```{r}
+library(tidyverse)
+library(Lahman)
+
+# ------------------------------------------------------------
+# 1. 데이터 준비
+# ------------------------------------------------------------
+
+# 스테로이드 시대: 1994-2005
+# 최근 시대: 2010-2025
+# 코로나 시즌 2020년은 제외
+target_years_24 <- c(1994:2005, setdiff(2010:2025, 2020))
+
+teams_24 <- Lahman::Teams %>%
+  as_tibble() %>%
+  filter(yearID %in% target_years_24) %>%
+  transmute(
+    yearID,
+    teamID,
+    lgID,
+    W,
+    L,
+    G_binom = W + L,
+    WPct = W / G_binom,
+    RS = R,
+    RA = RA,
+    era = if_else(
+      yearID >= 1994 & yearID <= 2005,
+      "Steroid era: 1994-2005",
+      "Recent era: 2010-2025"
+    ),
+    steroid_era = as.integer(yearID >= 1994 & yearID <= 2005),
+    log_rs_ra = log(RS / RA),
+    steroid_log_rs_ra = steroid_era * log_rs_ra
+  ) %>%
+  filter(
+    !is.na(W),
+    !is.na(L),
+    !is.na(RS),
+    !is.na(RA),
+    G_binom > 0,
+    WPct > 0,
+    WPct < 1,
+    RS > 0,
+    RA > 0
+  )
+
+available_years_24 <- sort(unique(teams_24$yearID))
+missing_years_24 <- setdiff(target_years_24, available_years_24)
+
+year_summary_24 <- tibble(
+  requested_years = paste(target_years_24, collapse = ", "),
+  used_years = paste(available_years_24, collapse = ", "),
+  years_not_found_in_Lahman_package = if (length(missing_years_24) == 0) {
+    "없음"
+  } else {
+    paste(missing_years_24, collapse = ", ")
+  },
+  n_team_seasons = nrow(teams_24)
+)
+
+knitr::kable(
+  year_summary_24,
+  caption = "문제 2-4 분석에 사용한 연도와 팀-시즌 수"
+)
+
+team_year_check_24 <- teams_24 %>%
+  count(yearID, teamID, name = "rows_per_team_year") %>%
+  summarise(
+    n_team_year_combinations = n(),
+    duplicated_team_years = sum(rows_per_team_year > 1),
+    max_rows_per_team_year = max(rows_per_team_year),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  team_year_check_24,
+  caption = "teamID와 yearID 조합의 중복 여부 확인"
+)
+
+era_summary_24 <- teams_24 %>%
+  group_by(era) %>%
+  summarise(
+    first_year = min(yearID),
+    last_year = max(yearID),
+    n_team_seasons = n(),
+    total_wins = sum(W),
+    total_losses = sum(L),
+    mean_WPct = mean(WPct),
+    mean_RS = mean(RS),
+    mean_RA = mean(RA),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  era_summary_24 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "시대별 분석 자료 요약"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 2. g = 0 검정을 위한 로지스틱 회귀모형 적합
+# ------------------------------------------------------------
+
+# 귀무모형: 두 시대의 k가 같다.
+# logit(p) = k * log(RS / RA)
+common_k_fit_24 <- glm(
+  cbind(W, L) ~ 0 + log_rs_ra,
+  data = teams_24,
+  family = binomial(link = "logit")
+)
+
+# 대립모형: 스테로이드 시대와 최근 시대의 k가 다르다.
+# logit(p) = k * log(RS / RA)
+#            + g * I(steroid era) * log(RS / RA)
+steroid_fit_24 <- glm(
+  cbind(W, L) ~ 0 + log_rs_ra + steroid_log_rs_ra,
+  data = teams_24,
+  family = binomial(link = "logit")
+)
+
+summary(steroid_fit_24)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 3. k, g, k + g 추정치와 신뢰구간
+# ------------------------------------------------------------
+
+coef_24 <- coef(steroid_fit_24)
+vcov_24 <- vcov(steroid_fit_24)
+
+k_recent_24 <- unname(coef_24["log_rs_ra"])
+g_hat_24 <- unname(coef_24["steroid_log_rs_ra"])
+k_steroid_24 <- k_recent_24 + g_hat_24
+
+se_k_recent_24 <- sqrt(vcov_24["log_rs_ra", "log_rs_ra"])
+se_g_24 <- sqrt(vcov_24["steroid_log_rs_ra", "steroid_log_rs_ra"])
+
+se_k_steroid_24 <- sqrt(
+  vcov_24["log_rs_ra", "log_rs_ra"] +
+    vcov_24["steroid_log_rs_ra", "steroid_log_rs_ra"] +
+    2 * vcov_24["log_rs_ra", "steroid_log_rs_ra"]
+)
+
+param_table_24 <- tibble(
+  term = c(
+    "k_recent",
+    "g_steroid_minus_recent",
+    "k_steroid"
+  ),
+  meaning = c(
+    "최근 시대 2010-2025의 k",
+    "스테로이드 시대 k와 최근 시대 k의 차이",
+    "스테로이드 시대 1994-2005의 k = k + g"
+  ),
+  estimate = c(
+    k_recent_24,
+    g_hat_24,
+    k_steroid_24
+  ),
+  std_error = c(
+    se_k_recent_24,
+    se_g_24,
+    se_k_steroid_24
+  )
+) %>%
+  mutate(
+    z_value = estimate / std_error,
+    p_value = 2 * pnorm(abs(z_value), lower.tail = FALSE),
+    conf_low = estimate - 1.96 * std_error,
+    conf_high = estimate + 1.96 * std_error
+  )
+
+knitr::kable(
+  param_table_24 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "시대별 k 계수와 g 계수 추정 결과"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 4. g = 0 가설검정
+# ------------------------------------------------------------
+
+# Wald 검정: steroid_log_rs_ra 계수의 z-test
+wald_g_24 <- summary(steroid_fit_24)$coefficients["steroid_log_rs_ra", ]
+
+wald_test_table_24 <- tibble(
+  test = "Wald test for H0: g = 0",
+  statistic = unname(wald_g_24["z value"]),
+  df = NA_real_,
+  p_value = unname(wald_g_24["Pr(>|z|)"])
+)
+
+# 우도비 검정: 공통 k 모형과 시대별 k 모형 비교
+lrt_raw_24 <- anova(
+  common_k_fit_24,
+  steroid_fit_24,
+  test = "Chisq"
+)
+
+lrt_test_table_24 <- tibble(
+  test = "Likelihood ratio test for H0: g = 0",
+  statistic = lrt_raw_24$Deviance[2],
+  df = lrt_raw_24$Df[2],
+  p_value = lrt_raw_24$`Pr(>Chi)`[2]
+)
+
+test_table_24 <- bind_rows(
+  wald_test_table_24,
+  lrt_test_table_24
+)
+
+knitr::kable(
+  test_table_24 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "g = 0에 대한 Wald 검정과 우도비 검정"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 5. 예측 승률 확인
+# ------------------------------------------------------------
+
+teams_24_pred <- teams_24 %>%
+  mutate(
+    fitted_common_k = fitted(common_k_fit_24),
+    fitted_era_specific_k = fitted(steroid_fit_24),
+    eta_era_specific_k = predict(steroid_fit_24, type = "link")
+  )
+
+ggplot(teams_24_pred, aes(x = WPct, y = fitted_era_specific_k)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~ era) +
+  coord_equal() +
+  labs(
+    x = "Observed WPct",
+    y = "Fitted WPct",
+    title = "Observed WPct vs fitted WPct: era-specific k model"
+  ) +
+  theme_minimal()
+
+prediction_metrics_24 <- teams_24_pred %>%
+  summarise(
+    RMSE_common_k = sqrt(mean((WPct - fitted_common_k)^2)),
+    MAE_common_k = mean(abs(WPct - fitted_common_k)),
+    RMSE_era_specific_k = sqrt(mean((WPct - fitted_era_specific_k)^2)),
+    MAE_era_specific_k = mean(abs(WPct - fitted_era_specific_k)),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  prediction_metrics_24 %>%
+    mutate(across(where(is.numeric), ~ round(.x, 5))),
+  caption = "공통 k 모형과 시대별 k 모형의 승률 예측 오차 비교"
+)
+```
+
+```{r}
+# ------------------------------------------------------------
+# 6. 본문 해석에 사용할 문자열 생성
+# ------------------------------------------------------------
+
+g_p_lrt_24 <- lrt_test_table_24$p_value[1]
+g_p_wald_24 <- wald_test_table_24$p_value[1]
+
+g_direction_text_24 <- if (g_hat_24 > 0) {
+  "양수이므로 스테로이드 시대의 k가 최근 시대의 k보다 큰 방향으로 추정되었다."
+} else if (g_hat_24 < 0) {
+  "음수이므로 스테로이드 시대의 k가 최근 시대의 k보다 작은 방향으로 추정되었다."
+} else {
+  "0으로 추정되어 두 시대의 k가 같은 방향으로 추정되었다."
+}
+
+g_conclusion_text_24 <- if (g_p_lrt_24 < 0.05) {
+  paste0(
+    "우도비 검정 기준 p-value가 ",
+    signif(g_p_lrt_24, 4),
+    "로 0.05보다 작으므로, 유의수준 5%에서 g = 0이라는 귀무가설을 기각한다. ",
+    "따라서 스테로이드 시대와 최근 시대의 k 계수가 유의하게 다르다는 통계적 근거가 있다."
+  )
+} else {
+  paste0(
+    "우도비 검정 기준 p-value가 ",
+    signif(g_p_lrt_24, 4),
+    "로 0.05보다 크므로, 유의수준 5%에서 g = 0이라는 귀무가설을 기각하지 못한다. ",
+    "따라서 이 자료만으로는 스테로이드 시대와 최근 시대의 k 계수가 유의하게 다르다고 보기 어렵다."
+  )
+}
+
+model_comparison_text_24 <- if (
+  prediction_metrics_24$RMSE_era_specific_k < prediction_metrics_24$RMSE_common_k
+) {
+  "시대별 k 모형의 RMSE가 공통 k 모형보다 작으므로 표본 내 승률 예측은 시대별 k 모형이 약간 더 좋다."
+} else {
+  "시대별 k 모형의 RMSE가 공통 k 모형보다 작지 않으므로 표본 내 승률 예측에서 시대별 k 모형의 뚜렷한 개선은 크지 않다."
+}
+
+# Python에서 같은 분석을 수행하고 R 결과와 비교하기 위한 객체 전달
+teams_24_py <- teams_24
+param_table_24_py <- param_table_24
+test_table_24_py <- test_table_24
+```
+
+## Python
+
+```{python}
+import numpy as np
+import pandas as pd
+from math import sqrt, erfc, lgamma
+
+# ------------------------------------------------------------
+# 1. R에서 정리한 분석용 데이터 가져오기
+# ------------------------------------------------------------
+
+teams = pd.DataFrame(r.teams_24_py).copy()
+
+numeric_cols = [
+    "yearID", "W", "L", "G_binom", "WPct", "RS", "RA",
+    "steroid_era", "log_rs_ra", "steroid_log_rs_ra"
+]
+
+for col in numeric_cols:
+    teams[col] = pd.to_numeric(teams[col], errors="coerce")
+
+summary_py_24 = (
+    teams
+    .groupby("era")
+    .agg(
+        first_year=("yearID", "min"),
+        last_year=("yearID", "max"),
+        n_team_seasons=("teamID", "size"),
+        mean_WPct=("WPct", "mean"),
+        mean_RS=("RS", "mean"),
+        mean_RA=("RA", "mean")
+    )
+    .reset_index()
+)
+
+summary_py_24.round(4)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 2. grouped binomial logistic regression을 위한 함수
+# ------------------------------------------------------------
+
+def sigmoid(x):
+    x = np.clip(x, -35, 35)
+    return 1 / (1 + np.exp(-x))
+
+
+def binomial_loglik(success, failure, mu):
+    success = np.asarray(success, dtype=float)
+    failure = np.asarray(failure, dtype=float)
+    n = success + failure
+
+    eps = 1e-12
+    mu = np.clip(mu, eps, 1 - eps)
+
+    log_comb = np.array([
+        lgamma(ni + 1) - lgamma(yi + 1) - lgamma(ni - yi + 1)
+        for yi, ni in zip(success, n)
+    ])
+
+    return float(
+        np.sum(
+            log_comb +
+            success * np.log(mu) +
+            failure * np.log(1 - mu)
+        )
+    )
+
+
+def fit_binomial_irls(X, success, failure, max_iter=100, tol=1e-11):
+    """
+    Grouped binomial logistic regression by IRLS.
+
+    X에는 절편을 포함하지 않는다.
+    이 문제의 모형은 원래 수식상 절편이 없는 모형이다.
+    """
+    X = np.asarray(X, dtype=float)
+    success = np.asarray(success, dtype=float)
+    failure = np.asarray(failure, dtype=float)
+
+    n_trials = success + failure
+    y_prop = success / n_trials
+
+    n_obs, n_params = X.shape
+    beta = np.zeros(n_params)
+
+    for iteration in range(max_iter):
+        eta = X @ beta
+        mu = sigmoid(eta)
+
+        var = np.clip(mu * (1 - mu), 1e-10, None)
+        weights = n_trials * var
+        z = eta + (y_prop - mu) / var
+
+        XtW = X.T * weights
+        hessian = XtW @ X
+        rhs = XtW @ z
+
+        try:
+            beta_new = np.linalg.solve(hessian, rhs)
+        except np.linalg.LinAlgError:
+            beta_new = np.linalg.pinv(hessian) @ rhs
+
+        if np.max(np.abs(beta_new - beta)) < tol:
+            beta = beta_new
+            converged = True
+            break
+
+        beta = beta_new
+    else:
+        converged = False
+
+    eta = X @ beta
+    mu = sigmoid(eta)
+
+    info = (X.T * (n_trials * mu * (1 - mu))) @ X
+    cov = np.linalg.pinv(info)
+    se = np.sqrt(np.diag(cov))
+
+    loglik = binomial_loglik(success, failure, mu)
+
+    return {
+        "beta": beta,
+        "se": se,
+        "cov": cov,
+        "eta": eta,
+        "mu": mu,
+        "loglik": loglik,
+        "n_params": n_params,
+        "converged": converged,
+        "n_iter": iteration + 1
+    }
+
+
+def normal_2sided_pvalue(z):
+    return erfc(abs(z) / sqrt(2))
+
+
+def chi_square_1df_sf(x):
+    """
+    자유도 1인 카이제곱 분포의 survival function.
+    """
+    return erfc(sqrt(max(float(x), 0.0) / 2))
+
+
+def make_coef_table(terms, beta, se):
+    beta = np.asarray(beta, dtype=float)
+    se = np.asarray(se, dtype=float)
+
+    z_value = beta / se
+    p_value = np.array([normal_2sided_pvalue(z) for z in z_value])
+
+    return pd.DataFrame({
+        "term": terms,
+        "estimate": beta,
+        "std_error": se,
+        "z_value": z_value,
+        "p_value": p_value,
+        "conf_low": beta - 1.96 * se,
+        "conf_high": beta + 1.96 * se
+    })
+```
+
+```{python}
+# ------------------------------------------------------------
+# 3. 공통 k 모형과 시대별 k 모형 적합
+# ------------------------------------------------------------
+
+wins = teams["W"].to_numpy(dtype=float)
+losses = teams["L"].to_numpy(dtype=float)
+
+# 귀무모형: logit(p) = k * log(RS / RA)
+X_common = teams[["log_rs_ra"]].to_numpy(dtype=float)
+
+# 대립모형: logit(p) = k * log(RS / RA)
+#                    + g * I(steroid era) * log(RS / RA)
+X_full = teams[["log_rs_ra", "steroid_log_rs_ra"]].to_numpy(dtype=float)
+
+fit_common_py_24 = fit_binomial_irls(
+    X=X_common,
+    success=wins,
+    failure=losses
+)
+
+fit_full_py_24 = fit_binomial_irls(
+    X=X_full,
+    success=wins,
+    failure=losses
+)
+
+print("Common k model converged:", fit_common_py_24["converged"])
+print("Era-specific k model converged:", fit_full_py_24["converged"])
+print("Common k model iterations:", fit_common_py_24["n_iter"])
+print("Era-specific k model iterations:", fit_full_py_24["n_iter"])
+```
+
+```{python}
+# ------------------------------------------------------------
+# 4. k, g, k + g 추정치와 신뢰구간
+# ------------------------------------------------------------
+
+beta_full = fit_full_py_24["beta"]
+cov_full = fit_full_py_24["cov"]
+
+k_recent_py = beta_full[0]
+g_py = beta_full[1]
+k_steroid_py = beta_full[0] + beta_full[1]
+
+se_k_recent_py = sqrt(cov_full[0, 0])
+se_g_py = sqrt(cov_full[1, 1])
+se_k_steroid_py = sqrt(cov_full[0, 0] + cov_full[1, 1] + 2 * cov_full[0, 1])
+
+param_table_py_24 = pd.DataFrame({
+    "term": [
+        "k_recent",
+        "g_steroid_minus_recent",
+        "k_steroid"
+    ],
+    "meaning": [
+        "최근 시대 2010-2025의 k",
+        "스테로이드 시대 k와 최근 시대 k의 차이",
+        "스테로이드 시대 1994-2005의 k = k + g"
+    ],
+    "estimate": [
+        k_recent_py,
+        g_py,
+        k_steroid_py
+    ],
+    "std_error": [
+        se_k_recent_py,
+        se_g_py,
+        se_k_steroid_py
+    ]
+})
+
+param_table_py_24["z_value"] = (
+    param_table_py_24["estimate"] /
+    param_table_py_24["std_error"]
+)
+
+param_table_py_24["p_value"] = param_table_py_24["z_value"].apply(
+    normal_2sided_pvalue
+)
+
+param_table_py_24["conf_low"] = (
+    param_table_py_24["estimate"] -
+    1.96 * param_table_py_24["std_error"]
+)
+
+param_table_py_24["conf_high"] = (
+    param_table_py_24["estimate"] +
+    1.96 * param_table_py_24["std_error"]
+)
+
+param_table_py_24.round(4)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 5. g = 0 가설검정
+# ------------------------------------------------------------
+
+# Wald 검정
+wald_z_py = g_py / se_g_py
+wald_p_py = normal_2sided_pvalue(wald_z_py)
+
+# 우도비 검정
+lrt_stat_py = 2 * (
+    fit_full_py_24["loglik"] -
+    fit_common_py_24["loglik"]
+)
+
+lrt_p_py = chi_square_1df_sf(lrt_stat_py)
+
+test_table_py_24 = pd.DataFrame({
+    "test": [
+        "Wald test for H0: g = 0",
+        "Likelihood ratio test for H0: g = 0"
+    ],
+    "statistic": [
+        wald_z_py,
+        lrt_stat_py
+    ],
+    "df": [
+        np.nan,
+        1
+    ],
+    "p_value": [
+        wald_p_py,
+        lrt_p_py
+    ]
+})
+
+test_table_py_24.round(4)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 6. R과 Python 결과 비교
+# ------------------------------------------------------------
+
+param_table_r_24 = pd.DataFrame(r.param_table_24_py).copy()
+test_table_r_24 = pd.DataFrame(r.test_table_24_py).copy()
+
+param_compare_language_24 = (
+    param_table_py_24[["term", "estimate", "std_error", "p_value"]]
+    .rename(columns={
+        "estimate": "estimate_py",
+        "std_error": "std_error_py",
+        "p_value": "p_value_py"
+    })
+    .merge(
+        param_table_r_24[["term", "estimate", "std_error", "p_value"]],
+        on="term",
+        how="inner"
+    )
+    .rename(columns={
+        "estimate": "estimate_r",
+        "std_error": "std_error_r",
+        "p_value": "p_value_r"
+    })
+)
+
+param_compare_language_24["abs_estimate_diff"] = np.abs(
+    param_compare_language_24["estimate_py"] -
+    param_compare_language_24["estimate_r"]
+)
+
+param_compare_language_24["abs_se_diff"] = np.abs(
+    param_compare_language_24["std_error_py"] -
+    param_compare_language_24["std_error_r"]
+)
+
+param_compare_language_24.round(8)
+```
+
+```{python}
+# ------------------------------------------------------------
+# 7. 예측 승률 비교
+# ------------------------------------------------------------
+
+teams_pred_py_24 = teams.copy()
+teams_pred_py_24["fitted_common_k"] = fit_common_py_24["mu"]
+teams_pred_py_24["fitted_era_specific_k"] = fit_full_py_24["mu"]
+
+prediction_metrics_py_24 = pd.DataFrame({
+    "model": [
+        "Common k model",
+        "Era-specific k model"
+    ],
+    "RMSE_WPct": [
+        np.sqrt(np.mean((teams_pred_py_24["WPct"] - teams_pred_py_24["fitted_common_k"]) ** 2)),
+        np.sqrt(np.mean((teams_pred_py_24["WPct"] - teams_pred_py_24["fitted_era_specific_k"]) ** 2))
+    ],
+    "MAE_WPct": [
+        np.mean(np.abs(teams_pred_py_24["WPct"] - teams_pred_py_24["fitted_common_k"])),
+        np.mean(np.abs(teams_pred_py_24["WPct"] - teams_pred_py_24["fitted_era_specific_k"]))
+    ]
+})
+
+prediction_metrics_py_24.round(5)
+```
+```{python}
+# ------------------------------------------------------------
+# 8. Python 그래프 1:
+# 관측 승률과 era-specific k 모형의 예측 승률 비교
+# ------------------------------------------------------------
+
+import matplotlib.pyplot as plt
+
+teams_pred_py_24 = teams.copy()
+teams_pred_py_24["fitted_common_k"] = fit_common_py_24["mu"]
+teams_pred_py_24["fitted_era_specific_k"] = fit_full_py_24["mu"]
+
+era_order_24 = [
+    "Recent era: 2010-2025",
+    "Steroid era: 1994-2005"
+]
+
+era_order_24 = [
+    era_name for era_name in era_order_24
+    if era_name in teams_pred_py_24["era"].unique()
+]
+
+plot_min = min(
+    teams_pred_py_24["WPct"].min(),
+    teams_pred_py_24["fitted_era_specific_k"].min()
+)
+
+plot_max = max(
+    teams_pred_py_24["WPct"].max(),
+    teams_pred_py_24["fitted_era_specific_k"].max()
+)
+
+fig, axes = plt.subplots(
+    1,
+    len(era_order_24),
+    figsize=(5 * len(era_order_24), 4),
+    sharex=True,
+    sharey=True
+)
+
+if len(era_order_24) == 1:
+    axes = [axes]
+
+for ax, era_name in zip(axes, era_order_24):
+    plot_data = teams_pred_py_24[
+        teams_pred_py_24["era"] == era_name
+    ]
+
+    ax.scatter(
+        plot_data["WPct"],
+        plot_data["fitted_era_specific_k"],
+        alpha=0.65
+    )
+
+    ax.plot(
+        [plot_min, plot_max],
+        [plot_min, plot_max],
+        linestyle="--"
+    )
+
+    ax.set_title(era_name)
+    ax.set_xlabel("Observed WPct")
+    ax.set_ylabel("Fitted WPct")
+    ax.grid(True, alpha=0.3)
+
+fig.suptitle("Observed vs fitted WPct: era-specific k model")
+fig.tight_layout()
+
+plt.show()
+```
+
+```{python}
+# ------------------------------------------------------------
+# 9. Python 그래프 2:
+# log(RS / RA)에 따른 공통 k 모형과 era-specific k 모형의 예측 승률 비교
+# ------------------------------------------------------------
+
+x_grid_24 = np.linspace(
+    teams_pred_py_24["log_rs_ra"].min(),
+    teams_pred_py_24["log_rs_ra"].max(),
+    200
+)
+
+k_common_py = fit_common_py_24["beta"][0]
+k_recent_py = fit_full_py_24["beta"][0]
+g_py = fit_full_py_24["beta"][1]
+
+curve_rows_24 = []
+
+for era_name in era_order_24:
+    steroid_indicator = 1 if era_name == "Steroid era: 1994-2005" else 0
+
+    fitted_common = sigmoid(k_common_py * x_grid_24)
+
+    fitted_era_specific = sigmoid(
+        k_recent_py * x_grid_24 +
+        g_py * steroid_indicator * x_grid_24
+    )
+
+    curve_rows_24.append(
+        pd.DataFrame({
+            "log_rs_ra": x_grid_24,
+            "fitted_WPct": fitted_common,
+            "era": era_name,
+            "model": "Common k model"
+        })
+    )
+
+    curve_rows_24.append(
+        pd.DataFrame({
+            "log_rs_ra": x_grid_24,
+            "fitted_WPct": fitted_era_specific,
+            "era": era_name,
+            "model": "Era-specific k model"
+        })
+    )
+
+curve_data_py_24 = pd.concat(curve_rows_24, ignore_index=True)
+
+fig, axes = plt.subplots(
+    1,
+    len(era_order_24),
+    figsize=(5 * len(era_order_24), 4),
+    sharex=True,
+    sharey=True
+)
+
+if len(era_order_24) == 1:
+    axes = [axes]
+
+for ax, era_name in zip(axes, era_order_24):
+    points = teams_pred_py_24[
+        teams_pred_py_24["era"] == era_name
+    ]
+
+    curves = curve_data_py_24[
+        curve_data_py_24["era"] == era_name
+    ]
+
+    ax.scatter(
+        points["log_rs_ra"],
+        points["WPct"],
+        alpha=0.45,
+        label="Observed"
+    )
+
+    for model_name, linestyle in [
+        ("Common k model", "--"),
+        ("Era-specific k model", "-")
+    ]:
+        line_data = curves[curves["model"] == model_name]
+
+        ax.plot(
+            line_data["log_rs_ra"],
+            line_data["fitted_WPct"],
+            linestyle=linestyle,
+            label=model_name
+        )
+
+    ax.set_title(era_name)
+    ax.set_xlabel("log(RS / RA)")
+    ax.set_ylabel("WPct")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+fig.suptitle("Fitted WPct curves by era")
+fig.tight_layout()
+
+plt.show()
+```
+`
+
+:::
+
+### 데이터 랭글링 절차 설명
+
+먼저 Lahman 패키지의 `Teams` 데이터에서 스테로이드 시대인 1994년부터 2005년까지의 팀-시즌 자료와 최근 시대인 2010년부터 2025년까지의 팀-시즌 자료를 선택하였다. 
+단, 문제의 지시대로 코로나 시즌인 2020년은 제외하였다. 
+사용 중인 Lahman 패키지 버전에 따라 2025년 자료가 아직 포함되어 있지 않을 수 있으므로, 실제로 사용된 연도와 누락된 연도를 표로 확인하였다. 
+분석에 사용된 팀-시즌 수는 `r nrow(teams_24)`개이고, 실제 사용 연도는 `r paste(sort(unique(teams_24$yearID)), collapse = ", ")`이다.
+
+승률은 다음과 같이 계산하였다.
+
+$begin:math:display$
+WPct \= \\frac\{W\}\{W\+L\}\.
+$end:math:display$
+
+로지스틱 회귀에서는 승률 자체를 연속형 반응변수처럼 사용하지 않고, $begin:math:text$W$end:math:text$를 성공 횟수, $begin:math:text$L$end:math:text$을 실패 횟수로 보는 grouped binomial 모형을 사용하였다. 
+이는 각 팀-시즌에서 $begin:math:text$W\+L$end:math:text$경기 중 $begin:math:text$W$end:math:text$번 승리했다고 보는 방식이다.
+
+또한 $begin:math:text$RS$end:math:text$는 득점, $begin:math:text$RA$end:math:text$는 실점으로 정의하였다. 
+Lahman의 `Teams` 데이터에서는 득점이 `R`로 저장되어 있으므로, 분석에서는 이를 `RS`로 이름을 바꾸어 사용하였다. 
+모형의 핵심 설명변수는 다음 두 변수이다.
+
+$begin:math:display$
+\\log\(RS\/RA\)\,
+$end:math:display$
+
+$begin:math:display$
+I\(1994 \\le t \\le 2005\)\\log\(RS\/RA\)\.
+$end:math:display$
+
+두 번째 변수의 회귀계수가 바로 스테로이드 시대와 최근 시대의 $begin:math:text$k$end:math:text$ 차이를 나타내는 $begin:math:text$g$end:math:text$이다.
+
+### 모형과 가설검정
+
+적합한 대립모형은 다음과 같다.
+
+$begin:math:display$
+\\text\{logit\}\(p\_\{i\,t\}\)
+\=
+k\\log\(RS\_\{i\,t\}\/RA\_\{i\,t\}\)
+\+
+gI\(1994 \\le t \\le 2005\)\\log\(RS\_\{i\,t\}\/RA\_\{i\,t\}\)\.
+$end:math:display$
+
+여기서 최근 시대인 2010년부터 2025년까지는 지시변수가 0이므로 $begin:math:text$k$end:math:text$가 최근 시대의 계수이다. 
+스테로이드 시대인 1994년부터 2005년까지는 지시변수가 1이므로 계수가 $begin:math:text$k\+g$end:math:text$가 된다. 
+따라서 $begin:math:text$g$end:math:text$는 스테로이드 시대의 $begin:math:text$k$end:math:text$와 최근 시대의 $begin:math:text$k$end:math:text$의 차이이다.
+
+검정하고자 하는 가설은 다음과 같다.
+
+$begin:math:display$
+H\_0\: g \= 0
+$end:math:display$
+
+$begin:math:display$
+H\_A\: g \\ne 0
+$end:math:display$
+
+귀무가설이 맞으면 스테로이드 시대와 최근 시대의 $begin:math:text$k$end:math:text$ 계수는 같다. 
+반대로 귀무가설을 기각하면 두 시대의 $begin:math:text$k$end:math:text$ 계수가 유의하게 다르다고 해석한다.
+
+### 분석 결과 해석
+
+최근 시대의 $begin:math:text$k$end:math:text$ 추정치는 `r round(k_recent_24, 4)`이다. 
+스테로이드 시대와 최근 시대의 차이를 나타내는 $begin:math:text$g$end:math:text$의 추정치는 `r round(g_hat_24, 4)`이고, 95% 신뢰구간은 
+\[
+(`r round(param_table_24$conf_low[param_table_24$term == "g_steroid_minus_recent"], 4)`,\ 
+ `r round(param_table_24$conf_high[param_table_24$term == "g_steroid_minus_recent"], 4)`)
+\]
+이다. 
+따라서 스테로이드 시대의 $begin:math:text$k$end:math:text$, 즉 $begin:math:text$k\+g$end:math:text$의 추정치는 `r round(k_steroid_24, 4)`이다.
+
+$begin:math:text$g$end:math:text$의 부호를 보면, `r g_direction_text_24`
+
+Wald 검정의 p-value는 `r signif(g_p_wald_24, 4)`이고, 공통 $begin:math:text$k$end:math:text$ 모형과 시대별 $begin:math:text$k$end:math:text$ 모형을 비교한 우도비 검정의 p-value는 `r signif(g_p_lrt_24, 4)`이다. 
+주된 결론은 우도비 검정을 기준으로 해석하였다.
+
+`r g_conclusion_text_24`
+
+### 예측 결과 비교
+
+공통 $begin:math:text$k$end:math:text$ 모형은 두 시대에 같은 $begin:math:text$k$end:math:text$ 값을 사용한다. 
+반면 시대별 $begin:math:text$k$end:math:text$ 모형은 스테로이드 시대와 최근 시대의 $begin:math:text$k$end:math:text$가 달라질 수 있도록 허용한다. 
+두 모형의 예측 성능은 관측 승률과 예측 승률의 RMSE 및 MAE로 비교하였다.
+
+`r model_comparison_text_24`
+
+다만 시대별 $begin:math:text$k$end:math:text$ 모형은 공통 $begin:math:text$k$end:math:text$ 모형보다 모수가 하나 더 많으므로, 단순히 표본 내 예측 오차가 조금 작다는 이유만으로 반드시 더 좋은 모형이라고 보기는 어렵다. 
+따라서 이 문제의 핵심 판단은 $begin:math:text$g\=0$end:math:text$에 대한 Wald 검정 및 우도비 검정 결과를 바탕으로 하는 것이 적절하다.
+
+### R과 Python 결과 비교
+
+R에서는 `glm(..., family = binomial(link = "logit"))`을 사용하여 grouped binomial logistic regression을 적합하였다. 
+Python에서는 같은 데이터와 같은 설계행렬을 사용하여 IRLS 알고리즘을 직접 구현하였다. 
+두 언어 모두 절편이 없는 모형을 적합했고, $begin:math:text$W$end:math:text$를 성공 횟수, $begin:math:text$L$end:math:text$을 실패 횟수로 사용하는 같은 grouped binomial likelihood를 사용하였다.
+
+따라서 R과 Python의 $begin:math:text$k$end:math:text$, $begin:math:text$g$end:math:text$, $begin:math:text$k\+g$end:math:text$ 추정치는 거의 같아야 한다. 
+비교표의 `abs_estimate_diff`와 `abs_se_diff`가 매우 작으면 두 언어에서 사실상 같은 결과를 얻었다고 볼 수 있다. 
+작은 차이가 있다면 이는 통계적 모형의 차이가 아니라 반복 알고리즘의 수렴 기준, 행렬 역행렬 계산 방식, 부동소수점 연산 차이에서 비롯된 수치적 차이이다.
+
+Python 탭에도 두 가지 그래프를 추가하였다. 
+첫 번째 그래프는 관측 승률과 시대별 \(k\) 모형의 예측 승률을 비교한다. 
+점들이 대각선 \(y=x\) 주변에 가까이 위치할수록 모형의 예측 승률이 관측 승률과 잘 맞는다고 볼 수 있다. 
+두 번째 그래프는 \(\log(RS/RA)\)에 따른 예측 승률 곡선을 스테로이드 시대와 최근 시대별로 보여준다. 
+공통 \(k\) 모형은 두 시대에 같은 기울기를 사용하고, 시대별 \(k\) 모형은 스테로이드 시대에서 \(k+g\), 최근 시대에서 \(k\)를 사용한다. 
+따라서 두 곡선의 차이는 \(g\) 추정치가 승률 예측에 어느 정도 영향을 주는지 시각적으로 보여준다.
+
 
 # 3부  데이터 분석 기술
 
@@ -188,6 +5877,68 @@ EXPOSE 8888
 ```
 
 ### 답안
+문제 3-1에서는 숙제 3 제출용 GitHub 저장소의 최상위 디렉토리에 `Dockerfile`을 추가하였다. 
+이 파일은 Binder가 온라인 주피터 노트북 실행 환경을 만들 때 사용할 컨테이너 환경 설정 파일이다. 
+숙제 3에서는 R과 Python을 모두 사용하므로, Dockerfile에는 R 환경, Python 환경, `reticulate`, 주피터 커널, 그리고 과제에서 사용하는 R/Python 패키지를 함께 설치하도록 설정하였다.
+
+특히 과제의 분석 코드에서 `Lahman`, `NHANES`, `tidyverse`, `reticulate` 등을 사용하므로, 기본 Dockerfile에 과제 실행에 필요한 R 패키지를 추가하였다. 
+또한 Python 코드 실행을 위해 `numpy`, `pandas`, `matplotlib`, `scipy`, `ipykernel`을 conda 환경에 설치하였다.
+
+저장소 최상위 디렉토리에 추가한 `Dockerfile`의 내용은 다음과 같다.
+
+```dockerfile
+# 1. 기반 이미지 설정
+FROM rocker/tidyverse:4.4.0
+
+# 2. 시스템 의존성 설치
+USER root
+RUN apt-get update && apt-get install -y \
+    wget \
+    git \
+    imagemagick \
+    libmagick++-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 3. Miniconda 설치
+ENV CONDA_DIR /opt/conda
+RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh && \
+    /bin/bash ~/miniconda.sh -b -p /opt/conda && \
+    rm ~/miniconda.sh
+
+# 4. Conda 경로 설정 및 Python 환경 생성
+ENV PATH=$CONDA_DIR/bin:$PATH
+RUN conda create -n r-reticulate python=3.10 -y && \
+    conda install -n r-reticulate -c conda-forge \
+        numpy pandas matplotlib scipy ipykernel -y && \
+    conda install -c conda-forge \
+        jupyter jupyterlab notebook -y && \
+    /opt/conda/envs/r-reticulate/bin/python -m ipykernel install \
+        --name r-reticulate \
+        --display-name "Python (r-reticulate)" \
+        --prefix=/opt/conda && \
+    conda clean -afy
+
+# 5. R 패키지 설치
+RUN R -e "install.packages(c('reticulate', 'remotes', 'IRkernel', 'NHANES', 'Lahman', 'mosaic'), repos = 'https://cloud.r-project.org')" && \
+    R -e "IRkernel::installspec(user = FALSE)"
+
+# 6. reticulate가 사용할 Python 경로 고정
+ENV RETICULATE_PYTHON=/opt/conda/envs/r-reticulate/bin/python
+
+# 7. Binder 사용자를 위한 권한 설정
+RUN chown -R ${NB_USER:-root} /opt/conda
+
+# 기본 실행 경로 설정
+WORKDIR /home/rstudio
+```
+
+이 Dockerfile은 `rocker/tidyverse:4.4.0` 이미지를 기반으로 한다. 
+따라서 R과 tidyverse가 포함된 환경에서 시작하며, 이후 시스템 라이브러리, Miniconda, Python 패키지, R 패키지를 추가로 설치한다. 
+`RETICULATE_PYTHON` 환경변수는 Quarto 문서 안에서 R의 `reticulate` 패키지가 사용할 Python 실행 파일을 `/opt/conda/envs/r-reticulate/bin/python`으로 고정한다. 
+이를 통해 로컬 환경과 Binder 환경에서 R-Python 연동 결과가 달라지는 것을 줄일 수 있다.
+
+정리하면, 이 Dockerfile은 숙제 3의 Quarto 문서와 자동 생성된 Jupyter Notebook 파일을 Binder에서 재현 가능하게 실행하기 위한 컨테이너 환경 설정 파일이다.
+
 
 ## 문제 3-2. GitHub Actions 워크플로우 수정
 
@@ -212,6 +5963,72 @@ EXPOSE 8888
 ```
 
 ### 답안
+문제 3-2에서는 숙제 2에서 사용했던 `.github/workflows/publish.yml` 파일을 수정하여, 기존 GitHub Pages 배포 작업 뒤에 Docker image를 빌드하고 GitHub Container Registry, 즉 GHCR에 push하는 단계를 추가하였다.
+
+기존 `publish.yml`은 `main` branch에 push가 발생하면 저장소를 checkout하고, `README.md`를 `index.md`로 복사한 뒤, 현재 디렉토리의 파일들을 `gh-pages` branch로 배포하는 구조였다. 
+숙제 3에서는 Binder에서 사용할 수 있는 컨테이너 이미지를 자동으로 생성해야 하므로, workflow의 권한에 `packages: write`를 추가하고, 배포 단계 끝에 GHCR 로그인 단계와 Docker image build/push 단계를 추가하였다.
+
+수정한 `.github/workflows/publish.yml` 파일은 다음과 같다.
+
+```yaml
+name: Publish Existing Quarto Output
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Prepare README as Index
+        run: cp README.md index.md
+
+      - name: Deploy existing _site to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./
+          publish_branch: gh-pages
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/my-r-env:latest
+```
+
+여기서 `contents: write`는 기존처럼 `gh-pages` branch에 결과물을 배포하기 위해 필요하다. 
+새로 추가한 `packages: write`는 GitHub Actions가 GitHub Container Registry에 Docker image를 push할 수 있도록 허용하는 권한이다. 
+`docker/login-action@v3` 단계에서는 `ghcr.io`에 로그인하며, 비밀번호로 GitHub Actions에서 자동으로 제공하는 `${{ secrets.GITHUB_TOKEN }}`을 사용한다. 
+그다음 `docker/build-push-action@v5` 단계에서 저장소 최상위 디렉토리의 `Dockerfile`을 이용해 Docker image를 빌드하고, 이를 `ghcr.io/${{ github.repository_owner }}/my-r-env:latest`라는 태그로 GHCR에 push한다.
+
+따라서 이 workflow가 성공하면 GitHub Pages 배포가 수행된 뒤, 같은 저장소의 `Dockerfile`을 기반으로 Binder에서 사용할 수 있는 Docker container image도 자동으로 생성된다.
+처음에는 문제 예시처럼 `ghcr.io/${{ github.repository_owner }}/my-r-env:latest`를 사용하였다. 
+그러나 GitHub Classroom 저장소의 owner가 개인 계정이 아니라 수업 organization인 `snu-stat`였기 때문에, workflow가 `ghcr.io/snu-stat/my-r-env:latest`로 push를 시도하였다. 
+이 과정에서 organization package에 대한 `write_package` 권한이 없어 `permission_denied: write_package` 오류가 발생하였다. 
+따라서 실제 workflow에서는 image가 현재 과제 저장소와 연결되도록 `ghcr.io/${{ github.repository }}:latest`를 사용하였다. 
+이 경우 image 주소는 `ghcr.io/snu-stat/hw3-2-ysk0126:latest`가 되며, Binder 링크도 이에 맞추어 작성하였다.
+
 
 ## 문제 3-3. GitHub Pages에 Binder 링크 추가
 
@@ -236,4 +6053,42 @@ GitHub Page를 사용하여 저장소를 웹페이지로 활용하는 부분은 
 작업을 GitHub 원격 저장소로 push한 후 숙제 2 문제 3-3의 3, 4번 과정을 반복하라.
 
 ### 답안
+문제 3-3에서는 GitHub Pages에서 보이는 첫 화면을 만들기 위해 저장소 최상위 디렉토리에 `README.md` 파일을 작성하였다. 
+숙제 2와 마찬가지로 GitHub Pages를 사용하여 저장소를 웹페이지처럼 활용하되, 이번에는 단순히 `.ipynb` 파일을 내려받는 링크만 제공하는 것이 아니라 Binder를 통해 온라인에서 주피터 노트북을 바로 실행할 수 있는 링크를 추가하였다.
+
+이전 단계에서 작성한 GitHub Actions workflow는 `README.md`를 `index.md`로 복사한 뒤 GitHub Pages에 배포한다. 
+따라서 저장소 최상위 디렉토리에 있는 `README.md`는 GitHub Pages의 첫 화면 역할을 한다.
+
+저장소 최상위 디렉토리에 작성한 `README.md`의 내용은 다음과 같다.
+
+```markdown
+# 숙제 3
+
+이름: 김연수  
+학번: [나의 학번]
+
+이 숙제의 상세 분석 결과는 아래 링크에서 확인하실 수 있습니다.
+
+* [분석 리포트 (HTML)](./hw03.html)
+* [주피터 노트북 (Binder)](https://mybinder.org/v2/ghcr/snu-stat/hw3-2-ysk0126/latest?filepath=hw03.ipynb)
+
+```
+
+여기서 `ysk0126`은 제출자의 GitHub 사용자 아이디이다. 
+따라서 다른 사용자가 같은 구조를 사용할 경우에는 Binder 링크의 `ysk0126` 부분을 자신의 GitHub 사용자 아이디로 바꾸어야 한다. 
+또한 GitHub Actions workflow의 Docker image push 단계에서 사용한 image tag가 `ghcr.io/${{ github.repository_owner }}/my-r-env:latest`였으므로, Binder 링크의 GHCR owner 부분도 이 image owner와 일치해야 한다.
+
+GitHub Container Registry의 image 주소는 일반적으로 `ghcr.io/NAMESPACE/IMAGE_NAME:latest`와 같은 형태를 사용하며, `NAMESPACE`는 개인 계정 또는 조직 이름에 해당한다. 
+이 과제에서는 workflow에서 만든 image가 `ghcr.io/<유저명>/my-r-env:latest`이므로 Binder 링크에서는 다음과 같은 형태를 사용하였다.
+
+```text
+https://mybinder.org/v2/ghcr/<유저명>/my-r-env/latest?filepath=hw03.ipynb
+```
+
+이 링크를 클릭하면 Binder가 GHCR에 push된 Docker image를 사용하여 온라인 실행 환경을 만들고, 그 안에서 `hw03.ipynb` 노트북을 열 수 있다. 
+따라서 사용자는 별도로 R, Python, Quarto, 패키지를 설치하지 않아도 웹브라우저에서 분석 노트북을 실행할 수 있다.
+
+작업을 마친 뒤에는 `README.md`, `hw03.qmd`, `hw03.html`, `hw03.ipynb`, `Dockerfile`, `.github/workflows/publish.yml`, `student.yml`이 모두 숙제 3 GitHub 저장소에 올라가 있는지 확인하였다. 
+그다음 GitHub Actions 탭에서 workflow가 성공적으로 실행되었는지 확인하고, GitHub Pages 주소로 접속하여 HTML 리포트 링크와 Binder 링크가 정상적으로 보이는지 확인하였다.
+
 
