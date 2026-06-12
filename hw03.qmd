@@ -4,7 +4,7 @@ subtitle: "데이터과학 입문"
 author: "김연수"
 date: "2026-06-12"
 date-format: "YYYY-MM-DD"
-institute: "서울대학교 통계학과"
+institute: "서울대학교 분자의학 및 바이오제약학과"
 format:
   html:
     embed-resources: true
