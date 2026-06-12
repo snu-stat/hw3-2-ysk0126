@@ -12,7 +12,6 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Miniforge 설치
-# Miniforge는 conda-forge 기반 conda 배포판이라 GitHub Actions에서 더 안정적이다.
 ENV CONDA_DIR=/opt/conda
 ENV PATH=${CONDA_DIR}/bin:${PATH}
 
@@ -33,6 +32,7 @@ RUN conda create -n r-reticulate -c conda-forge --override-channels \
     ipykernel \
     notebook \
     jupyterlab \
+    jupyterhub \
     -y && \
     conda clean -afy
 
@@ -50,17 +50,21 @@ RUN python -m ipykernel install \
 RUN R -e "install.packages(c('reticulate', 'remotes', 'IRkernel', 'NHANES', 'Lahman', 'mosaic'), repos = 'https://cloud.r-project.org')" && \
     R -e "IRkernel::installspec(user = FALSE)"
 
-# 8. Binder/일반 사용자를 위한 권한 설정
-# rocker/tidyverse 이미지에는 rstudio 사용자가 있다.
+# 8. Binder 사용자 설정
 ENV NB_USER=rstudio
+ENV USER=rstudio
 ENV HOME=/home/rstudio
-
-RUN chown -R rstudio:rstudio /opt/conda /home/rstudio
 
 # 9. 기본 실행 경로 설정
 WORKDIR /home/rstudio
 
-# 저장소 파일들을 컨테이너 안으로 복사
+# 10. 저장소 파일들을 컨테이너 안으로 복사
 COPY --chown=rstudio:rstudio . /home/rstudio/
+
+# 11. 권한 설정
+RUN chown -R rstudio:rstudio /opt/conda /home/rstudio
+
+# 12. rocker 이미지에서 inherited entrypoint가 있으면 Binder 실행을 방해할 수 있으므로 제거
+ENTRYPOINT []
 
 USER rstudio
